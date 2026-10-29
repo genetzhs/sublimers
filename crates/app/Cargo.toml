@@ -11,6 +11,7 @@ name = "sublimers"
 path = "src/main.rs"
 
 [dependencies]
+similar = "2"
 sublimers-core = { path = "../core" }
 sublimers-syntax = { path = "../syntax" }
 eframe = "0.31"

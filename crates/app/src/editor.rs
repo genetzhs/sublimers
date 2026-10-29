@@ -593,6 +593,21 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Doc, a: ViewArgs) -> ViewResponse {
             let color = if caret_lines.contains(&v.row.line) { fg } else { gutter_fg };
             painter.text(pos2(gutter.right() - fold_w - char_w * 0.6, y), egui::Align2::RIGHT_CENTER, (v.row.line + 1).to_string(), font.clone(), color);
         }
+        // Git change bar along the gutter's left edge.
+        if let Some(Some(ch)) = doc.git_marks.1.get(v.row.line) {
+            let x = gutter.left() + 1.0;
+            let top = y_of(v.r);
+            match ch {
+                crate::git::LineChange::Added | crate::git::LineChange::Modified => {
+                    let col = if *ch == crate::git::LineChange::Added { Color32::from_rgb(0x8c, 0xc2, 0x65) } else { Color32::from_rgb(0xe5, 0xa5, 0x4b) };
+                    painter.rect_filled(Rect::from_min_size(pos2(x, top), vec2(3.0, row_h)), 0.0, col);
+                }
+                crate::git::LineChange::DeletedAbove => {
+                    let k = (row_h * 0.22).max(3.0);
+                    painter.add(egui::Shape::convex_polygon(vec![pos2(x, top - k), pos2(x + k * 1.4, top), pos2(x, top + k)], Color32::from_rgb(0xe0, 0x6c, 0x75), Stroke::NONE));
+                }
+            }
+        }
         if bookmarks.contains(&v.row.line) {
             painter.circle_filled(pos2(gutter.left() + char_w * 0.7, y), (row_h * 0.18).max(3.0), Color32::from_rgb(0x4f, 0x9c, 0xff));
         }

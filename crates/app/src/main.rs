@@ -1,4 +1,5 @@
 mod editor;
+mod git;
 mod palette;
 mod session;
 mod settings;
@@ -32,13 +33,17 @@ pub struct Doc {
     /// The file changed on disk while this buffer had unsaved edits.
     pub disk_conflict: bool,
     pub disk_deleted: bool,
+    /// File content at git HEAD: None = not loaded yet, Some(None) = untracked / no repo.
+    pub git_base: Option<Option<String>>,
+    /// Changed-line markers and the buffer version they were computed for.
+    pub git_marks: (u64, Vec<Option<git::LineChange>>),
 }
 
 impl Doc {
     fn new(buf: Buffer, hl: DocHighlight, group: usize) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self { id, buf, hl, reveal: false, scroll: Default::default(), group, rows: Default::default(), completion: None, words: (0, Vec::new()), preview: false, disk_conflict: false, disk_deleted: false }
+        Self { id, buf, hl, reveal: false, scroll: Default::default(), group, rows: Default::default(), completion: None, words: (0, Vec::new()), preview: false, disk_conflict: false, disk_deleted: false, git_base: None, git_marks: (u64::MAX, Vec::new()) }
     }
 }
 
@@ -124,6 +129,10 @@ pub struct App {
     update_window: bool,
     /// Result of a native file dialog running on a background thread.
     dialog_rx: Option<std::sync::mpsc::Receiver<DialogResult>>,
+    git_status: std::collections::HashMap<PathBuf, git::FileStatus>,
+    git_head: Option<String>,
+    git_rx: Option<std::sync::mpsc::Receiver<(std::collections::HashMap<PathBuf, git::FileStatus>, Option<String>)>>,
+    last_git_check: Option<std::time::Instant>,
 }
 
 /// Native file dialogs run off the UI thread: a blocking dialog freezes the window, and
@@ -186,6 +195,10 @@ impl App {
             update_rx: None,
             update_window: false,
             dialog_rx: None,
+            git_status: Default::default(),
+            git_head: None,
+            git_rx: None,
+            last_git_check: None,
         };
         trace("syntaxes loaded");
         match window {
@@ -421,6 +434,51 @@ impl App {
             }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
+    }
+
+    /// Refresh `git status` for the sidebar in the background every few seconds.
+    fn poll_git(&mut self) {
+        if let Some((st, head)) = self.git_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.git_rx = None;
+            self.git_status = st;
+            if head != self.git_head {
+                // A commit/checkout changed HEAD: re-read the base of every file.
+                self.git_head = head;
+                for d in &mut self.docs {
+                    d.git_base = None;
+                }
+            }
+        }
+        let due = self.last_git_check.is_none_or(|t| t.elapsed().as_secs() >= 3);
+        if !due || self.git_rx.is_some() {
+            return;
+        }
+        self.last_git_check = Some(std::time::Instant::now());
+        let dir = self.root.clone().or_else(|| self.docs[self.active].buf.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)));
+        let Some(dir) = dir else { return };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.git_rx = Some(rx);
+        std::thread::spawn(move || {
+            let head = git::repo_root(&dir).and_then(|r| git::head_commit(&r));
+            let _ = tx.send((git::status(&dir), head));
+        });
+    }
+
+    /// Keep the changed-line markers of a visible tab up to date.
+    fn update_git_marks(d: &mut Doc) {
+        let Some(path) = d.buf.path.clone() else { return };
+        if d.git_base.is_none() {
+            d.git_base = Some(git::head_content(&path));
+            d.git_marks.0 = u64::MAX;
+        }
+        if d.git_marks.0 == d.buf.version {
+            return;
+        }
+        d.git_marks = match d.git_base.as_ref().unwrap() {
+            // Skip huge files: diffing them on every keystroke would be noticeable.
+            Some(base) if d.buf.len() < 2_000_000 => (d.buf.version, git::line_changes(base, &d.buf.text())),
+            _ => (d.buf.version, Vec::new()),
+        };
     }
 
     fn run_dialog(&mut self, f: impl FnOnce() -> DialogResult + Send + 'static) {
@@ -1188,7 +1246,7 @@ impl App {
         tree_menu(&root_resp, &root, true, &mut act);
         let current = self.docs[self.active].buf.path.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            tree(ui, &root, &mut act, 0, current.as_deref());
+            tree(ui, &root, &mut act, 0, current.as_deref(), &self.git_status);
         });
         match act {
             Some(TreeAction::Preview(p)) => self.open_file_ext(&p, true),
@@ -1353,17 +1411,32 @@ fn tree_menu(r: &egui::Response, p: &Path, is_dir: bool, act: &mut Option<TreeAc
     });
 }
 
-fn tree(ui: &mut egui::Ui, dir: &Path, act: &mut Option<TreeAction>, depth: usize, current: Option<&Path>) {
+fn git_color(st: git::FileStatus) -> egui::Color32 {
+    match st {
+        git::FileStatus::Modified => egui::Color32::from_rgb(0xe5, 0xa5, 0x4b),
+        git::FileStatus::Added | git::FileStatus::Untracked => egui::Color32::from_rgb(0x8c, 0xc2, 0x65),
+        git::FileStatus::Deleted | git::FileStatus::Conflict => egui::Color32::from_rgb(0xe0, 0x6c, 0x75),
+    }
+}
+
+fn tree(ui: &mut egui::Ui, dir: &Path, act: &mut Option<TreeAction>, depth: usize, current: Option<&Path>, gs: &std::collections::HashMap<PathBuf, git::FileStatus>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = rd.filter_map(Result::ok).map(|e| e.path()).filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.') || n == "target" || n == "node_modules")).collect();
     entries.sort_by_key(|p| (!p.is_dir(), p.file_name().map(|n| n.to_ascii_lowercase())));
     for p in entries {
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         if p.is_dir() {
-            let r = egui::CollapsingHeader::new(name).id_salt(&p).default_open(false).show(ui, |ui| tree(ui, &p, act, depth + 1, current));
+            // Folders containing changes are tinted like Sublime's sidebar.
+            let changed = gs.keys().any(|k| k.starts_with(&p));
+            let title = if changed { egui::RichText::new(name).color(git_color(git::FileStatus::Modified)) } else { egui::RichText::new(name) };
+            let r = egui::CollapsingHeader::new(title).id_salt(&p).default_open(false).show(ui, |ui| tree(ui, &p, act, depth + 1, current, gs));
             tree_menu(&r.header_response, &p, true, act);
         } else {
-            let r = ui.selectable_label(current == Some(p.as_path()), name);
+            let label = match gs.get(&p) {
+                Some(st) => egui::RichText::new(name).color(git_color(*st)),
+                None => egui::RichText::new(name),
+            };
+            let r = ui.selectable_label(current == Some(p.as_path()), label);
             if r.double_clicked() {
                 *act = Some(TreeAction::Open(p.clone()));
             } else if r.clicked() {
@@ -1564,6 +1637,7 @@ impl eframe::App for App {
                     }
                     gui.advance_cursor_after_rect(bar);
                 }
+                Self::update_git_marks(&mut self.docs[di]);
                 let want_focus = g == self.focus && !self.palette.open && !self.find.focus;
                 let vr = editor::show(&mut gui, &mut self.docs[di], editor::ViewArgs { syn: &self.syn, theme: &theme, st: &self.settings, group: g, want_focus });
                 if vr.focused && self.active != di {
@@ -1593,6 +1667,7 @@ impl eframe::App for App {
         }
         self.file_dialog(ctx);
         self.poll_dialog(ctx);
+        self.poll_git();
         self.update_ui(ctx);
 
         if let Some(i) = self.pending_close {
