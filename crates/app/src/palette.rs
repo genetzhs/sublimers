@@ -106,7 +106,7 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
         ("Next File", "next_view"),
         ("Previous File", "prev_view"),
     ]),
-    ("Tools", &[("Command Palette…", "show_overlay_command"), ("Build", "build"), ("Build With…", "build_with"), ("Cancel Build", "cancel_build"), ("Build Results: Show/Hide", "show_panel_output"), ("Next Result", "next_result"), ("Previous Result", "prev_result"), ("Format File (LSP)", "lsp_format"), ("Restart Language Servers", "lsp_restart")]),
+    ("Tools", &[("Command Palette…", "show_overlay_command"), ("Terminal", "toggle_terminal"), ("Build", "build"), ("Build With…", "build_with"), ("Cancel Build", "cancel_build"), ("Build Results: Show/Hide", "show_panel_output"), ("Next Result", "next_result"), ("Previous Result", "prev_result"), ("Format File (LSP)", "lsp_format"), ("Restart Language Servers", "lsp_restart")]),
     ("Help", &[("Check for Updates…", "check_for_updates")]),
     ("Preferences", &[
         ("Select Color Scheme…", "select_theme"),

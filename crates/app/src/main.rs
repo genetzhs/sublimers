@@ -5,6 +5,7 @@ mod lsp;
 mod palette;
 mod session;
 mod settings;
+mod terminal;
 mod updater;
 
 use std::path::{Path, PathBuf};
@@ -80,6 +81,31 @@ fn lsp_root_for(file: &Path) -> PathBuf {
     }
     const MARKERS: &[&str] = &["Cargo.toml", "go.mod", "package.json", "pyproject.toml", "setup.py", "compile_commands.json"];
     dir.ancestors().find(|a| MARKERS.iter().any(|m| a.join(m).exists())).unwrap_or(dir).to_path_buf()
+}
+
+/// A centred modal card over a dimmed backdrop. Returns true if the backdrop was clicked.
+fn modal_card(ctx: &egui::Context, id: &str, add: impl FnOnce(&mut egui::Ui)) -> bool {
+    let screen = ctx.screen_rect();
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new((id, "backdrop"))).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
+        let r = ui.allocate_rect(screen, egui::Sense::click());
+        ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+        clicked = r.clicked();
+    });
+    egui::Area::new(egui::Id::new(id)).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        let v = ui.visuals().clone();
+        egui::Frame::new()
+            .fill(v.window_fill)
+            .stroke(egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color))
+            .corner_radius(14.0)
+            .shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: egui::Color32::from_black_alpha(110) })
+            .inner_margin(egui::Margin::same(28))
+            .show(ui, |ui| {
+                ui.set_width(460.0);
+                add(ui);
+            });
+    });
+    clicked
 }
 
 /// Split-view layout (Sublime's View → Layout).
@@ -181,6 +207,10 @@ pub struct App {
     git_status: std::collections::HashMap<PathBuf, git::FileStatus>,
     git_head: Option<String>,
     lsp: lsp::Manager,
+    term: Option<terminal::Terminal>,
+    term_focus: bool,
+    /// Restart automatically once the update is installed.
+    update_restart: bool,
     /// Bottom panel (build output / terminal) and its state.
     panel: Option<BottomPanel>,
     build: Option<build::Run>,
@@ -264,6 +294,9 @@ impl App {
             git_status: Default::default(),
             git_head: None,
             lsp: Default::default(),
+            term: None,
+            term_focus: false,
+            update_restart: false,
             panel: None,
             build: None,
             build_choice: None,
@@ -310,7 +343,8 @@ impl App {
             app.new_file();
         }
         app.apply_visuals(&cc.egui_ctx);
-        if app.primary && updater::due_for_auto_check() {
+        if app.primary {
+            // Check in the background on every launch; a new version opens the update card.
             app.check_updates(false);
         }
         app
@@ -954,71 +988,107 @@ impl App {
 
     fn update_ui(&mut self, ctx: &egui::Context) {
         if let Some(st) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            // A new version found by the background check asks right away.
+            if matches!(st, UpdateState::Available(_)) {
+                self.update_window = true;
+            }
             self.update = st;
             self.update_rx = None;
         }
         if !self.update_window {
             return;
         }
-        let mut open = true;
+        let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !matches!(self.update, UpdateState::Installing);
         let mut install = None;
         let mut restart = false;
-        egui::Window::new("Software Update").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_TOP, [0.0, 120.0]).show(ctx, |ui| {
-            ui.set_min_width(380.0);
-            ui.label(format!("Installed version: {}", updater::CURRENT));
-            ui.add_space(6.0);
-            match &self.update {
-                UpdateState::Idle | UpdateState::Checking => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Checking for updates…");
+        let installable = !matches!(updater::install_kind(), updater::Install::Other);
+        // Installed with "Update & Restart": restart as soon as the install succeeds.
+        if self.update_restart && matches!(self.update, UpdateState::Done(_)) {
+            restart = true;
+        }
+        let backdrop = modal_card(ctx, "update_dialog", |ui| {
+            let v = ui.visuals().clone();
+            let weak = v.text_color().gamma_multiply(0.75);
+            let accent = egui::Color32::from_rgb(0xff, 0x9a, 0x3d);
+            let (icon, title, subtitle): (&str, String, String) = match &self.update {
+                UpdateState::Idle | UpdateState::Checking => ("↻", "Checking for updates…".into(), format!("Installed version {}", updater::CURRENT)),
+                UpdateState::UpToDate => ("✓", "You're up to date".into(), format!("Sublimers {} is the latest version.", updater::CURRENT)),
+                UpdateState::Available(r) => ("⬆", format!("Sublimers {} is available", r.version), format!("You have {}. Your open files and unsaved work are kept across the restart.", updater::CURRENT)),
+                UpdateState::Installing => ("⬇", "Installing update…".into(), "Downloading and installing. Sublimers will restart when it's done.".into()),
+                UpdateState::Done(m) => ("✓", "Update installed".into(), m.clone()),
+                UpdateState::Error(e) => ("!", "Update failed".into(), e.clone()),
+            };
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                let col = if matches!(self.update, UpdateState::Error(_)) { egui::Color32::from_rgb(0xf0, 0x6a, 0x6a) } else { accent };
+                ui.painter().circle_filled(r.center(), 22.0, col.gamma_multiply(0.18));
+                if matches!(self.update, UpdateState::Checking | UpdateState::Idle | UpdateState::Installing) {
+                    egui::Spinner::new().size(22.0).color(col).paint_at(ui, egui::Rect::from_center_size(r.center(), egui::vec2(22.0, 22.0)));
+                } else {
+                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(22.0), col);
+                }
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(title).size(21.0).strong());
+                    ui.add_space(2.0);
+                    ui.label(egui::RichText::new(subtitle).size(14.5).color(weak));
+                });
+            });
+            if let UpdateState::Available(r) = &self.update {
+                let notes: String = r.notes.lines().filter(|l| !l.contains("Full Changelog")).collect::<Vec<_>>().join("\n");
+                if !notes.trim().is_empty() {
+                    ui.add_space(14.0);
+                    egui::Frame::new().fill(v.extreme_bg_color).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| ui.label(egui::RichText::new(notes.trim()).size(13.5)));
                     });
-                }
-                UpdateState::UpToDate => {
-                    ui.label("You're up to date.");
-                }
-                UpdateState::Available(r) => {
-                    ui.label(egui::RichText::new(format!("Version {} is available.", r.version)).strong());
-                    if !r.notes.trim().is_empty() {
-                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| ui.label(&r.notes));
-                    }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let label = match updater::install_kind() {
-                            updater::Install::AppImage(_) => Some("Download and Replace AppImage"),
-                            updater::Install::Deb => Some("Download and Install .deb"),
-                            updater::Install::Rpm => Some("Download and Install .rpm"),
-                            updater::Install::Other => None,
-                        };
-                        if let Some(l) = label {
-                            if ui.button(l).clicked() {
-                                install = Some(r.clone());
-                            }
-                        }
-                        ui.hyperlink_to("Release page", &r.page);
-                    });
-                }
-                UpdateState::Installing => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Downloading and installing…");
-                    });
-                }
-                UpdateState::Done(m) => {
-                    ui.label(m);
-                    if ui.button("Restart Now").clicked() {
-                        restart = true;
-                    }
-                }
-                UpdateState::Error(e) => {
-                    ui.colored_label(egui::Color32::from_rgb(0xff, 0x8a, 0x80), e);
                 }
             }
+            ui.add_space(22.0);
+            let btn = |text: &str, primary: bool| {
+                let mut rt = egui::RichText::new(text).size(15.0);
+                if primary {
+                    rt = rt.color(egui::Color32::BLACK).strong();
+                }
+                let b = egui::Button::new(rt).min_size(egui::vec2(110.0, 38.0)).corner_radius(8.0);
+                if primary { b.fill(accent) } else { b }
+            };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                match &self.update {
+                    UpdateState::Available(r) => {
+                        if installable && ui.add(btn("Update & Restart", true)).clicked() {
+                            install = Some(r.clone());
+                        }
+                        if ui.add(btn("Later", false)).clicked() {
+                            close = true;
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.hyperlink_to(egui::RichText::new("Release notes ↗").size(14.0), &r.page);
+                        });
+                    }
+                    UpdateState::Done(_) => {
+                        if ui.add(btn("Restart Now", true)).clicked() {
+                            restart = true;
+                        }
+                    }
+                    UpdateState::Installing => {}
+                    _ => {
+                        if ui.add(btn("OK", true)).clicked() {
+                            close = true;
+                        }
+                    }
+                }
+            });
         });
-        if !open {
+        if backdrop && !matches!(self.update, UpdateState::Installing) {
+            close = true;
+        }
+        if close {
             self.update_window = false;
         }
         if let Some(r) = install {
+            self.update_restart = true;
             self.install_update(r);
         }
         if restart {
@@ -1180,6 +1250,19 @@ impl App {
             }
             "next_result" => self.goto_build_error(true),
             "prev_result" => self.goto_build_error(false),
+            "toggle_terminal" => {
+                let focused = ctx.memory(|m| m.has_focus(egui::Id::new("terminal")));
+                if self.term.as_ref().is_some_and(|t| t.exited) {
+                    self.term = None;
+                }
+                if self.panel == Some(BottomPanel::Terminal) && focused {
+                    self.panel = None;
+                    self.focus_group(self.focus);
+                } else {
+                    self.panel = Some(BottomPanel::Terminal);
+                    self.term_focus = true;
+                }
+            }
             "show_panel_output" => self.panel = if self.panel == Some(BottomPanel::Output) { None } else { Some(BottomPanel::Output) },
             "lsp_restart" => {
                 self.lsp = Default::default();
@@ -1611,7 +1694,24 @@ impl App {
         }
     }
 
-    fn terminal_panel(&mut self, _ui: &mut egui::Ui) {}
+    fn terminal_panel(&mut self, ui: &mut egui::Ui) {
+        if self.term.is_none() {
+            let dir = self.root.clone().or_else(|| self.docs[self.active].buf.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))).or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from("/"));
+            match terminal::Terminal::spawn(&dir) {
+                Ok(t) => self.term = Some(t),
+                Err(e) => {
+                    ui.label(format!("Couldn't start a shell: {e}"));
+                    return;
+                }
+            }
+        }
+        let theme = self.syn.theme(&self.settings.color_scheme);
+        let bg = theme.settings.background.map(editor::c).unwrap_or(egui::Color32::from_gray(30));
+        let fg = theme.settings.foreground.map(editor::c).unwrap_or(egui::Color32::from_gray(220));
+        let want = std::mem::take(&mut self.term_focus);
+        let t = self.term.as_mut().unwrap();
+        t.show(ui, self.settings.font_size, bg, fg, want);
+    }
 
     /// Draggable dividers between split groups.
     fn split_dividers(&mut self, ctx: &egui::Context) {
@@ -2037,7 +2137,14 @@ impl eframe::App for App {
         }
         // Global keybindings (only when no text field other than the editor has focus).
         let typing_elsewhere = ctx.wants_keyboard_input() && !editor::editor_has_focus(ctx);
-        let cmds = settings::match_keys(ctx, &self.settings.keymap, typing_elsewhere);
+        let in_terminal = ctx.memory(|m| m.has_focus(egui::Id::new("terminal")));
+        let cmds = if in_terminal {
+            // The shell gets every key except the one that leaves it.
+            let toggle: Vec<settings::Binding> = self.settings.keymap.iter().filter(|b| b.command == "toggle_terminal").cloned().collect();
+            settings::match_keys(ctx, &toggle, false)
+        } else {
+            settings::match_keys(ctx, &self.settings.keymap, typing_elsewhere)
+        };
         for c in cmds {
             self.run_command(ctx, &c);
         }
@@ -2148,6 +2255,12 @@ impl eframe::App for App {
             });
         });
 
+        if let Some(t) = self.term.as_mut() {
+            t.poll();
+            if self.panel == Some(BottomPanel::Terminal) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            }
+        }
         if let Some(r) = self.build.as_mut() {
             r.poll();
             if r.running() {

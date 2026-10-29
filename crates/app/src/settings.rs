@@ -205,6 +205,7 @@ fn default_keymap() -> Vec<Binding> {
         ("ctrl+k, ctrl+4", "fold_level_4"),
         // Bookmarks
         ("f12", "goto_definition"),
+        ("ctrl+`", "toggle_terminal"),
         ("ctrl+b", "build"),
         ("f7", "build"),
         ("ctrl+shift+b", "build_with"),
@@ -358,4 +359,12 @@ pub fn shortcut_label(keymap: &[Binding], command: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod backtick_tests {
+    #[test]
+    fn parses_ctrl_backtick() {
+        assert!(super::parse_shortcut("ctrl+`").is_some());
+    }
 }

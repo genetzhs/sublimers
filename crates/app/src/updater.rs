@@ -130,22 +130,6 @@ pub fn apply(rel: &Release, kind: &Install) -> Result<String, String> {
     }
 }
 
-fn stamp_path() -> PathBuf {
-    crate::settings::config_dir().join("last_update_check")
-}
-
-/// True at most once a day, for the automatic background check.
-pub fn due_for_auto_check() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let last: u64 = std::fs::read_to_string(stamp_path()).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-    if now.saturating_sub(last) < 24 * 3600 {
-        return false;
-    }
-    let _ = std::fs::create_dir_all(crate::settings::config_dir());
-    let _ = std::fs::write(stamp_path(), now.to_string());
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

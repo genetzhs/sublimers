@@ -87,7 +87,7 @@ Verify downloads with `sha256sum -c SHA256SUMS`.
 
 ## Updating
 
-Sublimers checks GitHub for a new release once a day, and on demand from **Help → Check for Updates…**.
+Sublimers checks GitHub for a new release every time it starts, and on demand from **Help → Check for Updates…**. When one is out, a card offers **Update & Restart**: it installs the update and reopens with your files and unsaved work.
 When one is available, a notice appears in the status bar and a single click updates the app:
 
 | Installed from | How it updates |
