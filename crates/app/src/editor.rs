@@ -215,12 +215,43 @@ fn pos_at(b: &Buffer, rows: &Rows, r: usize, vis: f32) -> usize {
 pub struct Completion {
     pub items: Vec<String>,
     pub selected: usize,
+    /// Items from the language server; filtered by the typed prefix instead of buffer words.
+    pub lsp: Vec<String>,
+}
+
+/// Language-server items matching `prefix`: prefix matches first, then fuzzy ones.
+pub fn filter_lsp(items: &[String], prefix: &str) -> Vec<String> {
+    let lp = prefix.to_lowercase();
+    let mut starts = Vec::new();
+    let mut fuzzy = Vec::new();
+    for w in items {
+        let lw = w.to_lowercase();
+        if starts.contains(w) || fuzzy.contains(w) || *w == prefix {
+            continue;
+        }
+        if lw.starts_with(&lp) {
+            starts.push(w.clone());
+        } else if !lp.is_empty() && is_subsequence(&lp, &lw) {
+            fuzzy.push(w.clone());
+        }
+    }
+    starts.extend(fuzzy);
+    starts.truncate(12);
+    starts
 }
 
 fn update_completion(doc: &mut Doc) {
     let b = &doc.buf;
     let Some(s) = b.sels.last() else { return };
     let prefix = b.prefix_at(s.head);
+    if let Some(c) = doc.completion.as_mut().filter(|c| !c.lsp.is_empty()) {
+        c.items = filter_lsp(&c.lsp, &prefix);
+        c.selected = 0;
+        if c.items.is_empty() {
+            doc.completion = None;
+        }
+        return;
+    }
     let at_word_end = b.rope.get_char(s.head).is_none_or(|c| !is_word_char(c));
     if prefix.chars().count() < 2 || !at_word_end || !b.sels.iter().all(|s| s.is_empty()) {
         doc.completion = None;
@@ -249,7 +280,11 @@ fn update_completion(doc: &mut Doc) {
     }
     starts.extend(fuzzy);
     starts.truncate(12);
-    doc.completion = (!starts.is_empty()).then(|| Completion { items: starts, selected: 0 });
+    doc.completion = (!starts.is_empty()).then(|| Completion { items: starts, selected: 0, lsp: Vec::new() });
+    if prefix.chars().count() == 2 {
+        // A new word: ask the language server too; its answer replaces the buffer words.
+        doc.lsp_req.push(crate::LspReq::Completion(s.head));
+    }
 }
 
 /// Ctrl+Space: open the completion popup for the word before the caret.
@@ -257,6 +292,9 @@ pub fn trigger_completion(doc: &mut Doc) {
     doc.words.0 = 0;
     doc.completion = None;
     update_completion(doc);
+    if let Some(s) = doc.buf.sels.last() {
+        doc.lsp_req.push(crate::LspReq::Completion(s.head));
+    }
 }
 
 fn is_subsequence(needle: &str, hay: &str) -> bool {
@@ -313,6 +351,8 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Doc, a: ViewArgs) -> ViewResponse {
     ctx.memory_mut(|mem| mem.set_focus_lock_filter(id, egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false }));
     if resp.hovered() {
         ctx.set_cursor_icon(egui::CursorIcon::Text);
+        // Wake up once the pointer has rested, for the hover popup.
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 
     let visible_rows = (text_rect.height() / row_h).floor().max(1.0) as usize;
@@ -328,6 +368,7 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Doc, a: ViewArgs) -> ViewResponse {
     resp.context_menu(|ui| {
         ui.spacing_mut().button_padding = vec2(14.0, 6.0);
         for (label, cmd) in [
+            ("Goto Definition", "goto_definition"),
             ("Cut", "cut"),
             ("Copy", "copy"),
             ("Paste", "paste"),
@@ -644,6 +685,90 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Doc, a: ViewArgs) -> ViewResponse {
         minimap(ui, doc, syn, st, Rect::from_min_max(pos2(text_rect.right(), full.top()), full.max), bg, fg, visible_rows, row_h, a.group);
     }
 
+    // Diagnostics: wavy underline, red for errors, yellow for warnings.
+    if !doc.diagnostics.is_empty() {
+        let rows = rows_of(doc);
+        for d in &doc.diagnostics {
+            if d.start.0 >= doc.buf.rope.len_lines() {
+                continue;
+            }
+            let col = match d.severity {
+                crate::lsp::Severity::Error => Color32::from_rgb(0xf0, 0x55, 0x5a),
+                crate::lsp::Severity::Warning => Color32::from_rgb(0xe5, 0xc0, 0x4b),
+                crate::lsp::Severity::Info => Color32::from_rgb(0x6c, 0xa8, 0xe0),
+            };
+            let to_pos = |(l, c): (usize, usize)| {
+                let l = l.min(doc.buf.rope.len_lines() - 1);
+                doc.buf.line_start(l) + c.min(line_chars(&doc.buf, l))
+            };
+            let (a, mut b) = (to_pos(d.start), to_pos(d.end));
+            if b <= a {
+                b = (a + 1).min(doc.buf.line_start(d.start.0) + line_chars(&doc.buf, d.start.0)).max(a);
+            }
+            let (r0, v0) = locate(&doc.buf, &rows, a);
+            let (r1, v1) = locate(&doc.buf, &rows, b);
+            for r in r0.max(first)..=r1.min(last) {
+                let xa = if r == r0 { x_of(v0) } else { x_of(0) };
+                let xb = if r == r1 { x_of(v1.max(if r == r0 { v0 + 1 } else { 1 })) } else { text_rect.right() };
+                let y = y_of(r) + row_h - 2.5;
+                let mut pts = Vec::new();
+                let mut x = xa;
+                let mut up = true;
+                while x < xb {
+                    pts.push(pos2(x, if up { y - 1.5 } else { y + 1.0 }));
+                    x += 2.5;
+                    up = !up;
+                }
+                pts.push(pos2(xb, y));
+                tp.add(egui::Shape::line(pts, Stroke::new(1.2_f32, col)));
+            }
+        }
+    }
+
+    // Hover: after the pointer rests over text, show diagnostics and language-server info.
+    let mut hover_lines: Vec<(String, Color32)> = Vec::new();
+    let mut hover_at = None;
+    if let Some(p) = resp.hover_pos().filter(|_| doc.completion.is_none() && ui.input(|i| i.pointer.time_since_last_movement() > 0.45)) {
+        let (pos, line, _) = point_to(doc, &m, p);
+        let col = pos - doc.buf.line_start(line);
+        let on_text = doc.buf.rope.get_char(pos).is_some_and(|c| !c.is_whitespace());
+        for d in &doc.diagnostics {
+            let inside = (d.start.0, d.start.1) <= (line, col) && (line, col) <= (d.end.0, d.end.1.max(d.start.1 + 1));
+            if inside {
+                let col = if d.severity == crate::lsp::Severity::Error { Color32::from_rgb(0xf0, 0x80, 0x80) } else { fg };
+                hover_lines.push((d.message.clone(), col));
+            }
+        }
+        if on_text {
+            let (ws, we) = doc.buf.word_at(pos);
+            match &doc.hover {
+                Some((hp, text)) if (ws..we.max(ws + 1)).contains(hp) => hover_lines.push((text.clone(), fg)),
+                Some((hp, _)) if *hp == pos => {}
+                _ if !doc.lsp_req.contains(&crate::LspReq::Hover(pos)) => {
+                    doc.hover = Some((pos, String::new()));
+                    doc.lsp_req.push(crate::LspReq::Hover(pos));
+                }
+                _ => {}
+            }
+        }
+        hover_lines.retain(|(t, _)| !t.trim().is_empty());
+        hover_at = Some(p);
+    }
+    if let Some(p) = hover_at.filter(|_| !hover_lines.is_empty()) {
+        egui::Area::new(Id::new(("hover", a.group))).fixed_pos(p + vec2(8.0, 14.0)).order(egui::Order::Tooltip).interactable(false).show(&ctx, |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                ui.set_max_width(640.0);
+                for (i, (t, col)) in hover_lines.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    let t: String = t.lines().take(24).collect::<Vec<_>>().join("\n");
+                    ui.label(egui::RichText::new(t).font(FontId::monospace((st.font_size - 1.0).max(9.0))).color(*col));
+                }
+            });
+        });
+    }
+
     // Completion popup under the primary caret.
     let mut accept = None;
     if resp.has_focus() {
@@ -853,6 +978,12 @@ fn handle_keys(ctx: &egui::Context, doc: &mut Doc, page: usize, wrap_cols: Optio
                     if t.chars().all(is_word_char) {
                         update_completion(doc);
                         keep_completion = true;
+                    } else if t == "." || (t == ":" && doc.buf.sels.last().is_some_and(|s| s.head >= 2 && doc.buf.rope.char(s.head - 2) == ':')) {
+                        // Member access: ask the language server for completions.
+                        doc.completion = None;
+                        if let Some(s) = doc.buf.sels.last() {
+                            doc.lsp_req.push(crate::LspReq::Completion(s.head));
+                        }
                     }
                 }
             }
@@ -939,6 +1070,10 @@ fn handle_keys(ctx: &egui::Context, doc: &mut Doc, page: usize, wrap_cols: Optio
             }
         }
     }
+}
+
+fn line_chars(b: &Buffer, l: usize) -> usize {
+    b.rope.line(l).chars().filter(|c| *c != '\n' && *c != '\r').count()
 }
 
 fn point_to(doc: &Doc, m: &Metrics, p: egui::Pos2) -> (usize, usize, f32) {

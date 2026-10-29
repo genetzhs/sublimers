@@ -95,6 +95,7 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
         ("Goto Anything…", "show_overlay_goto"),
         ("Goto Symbol…", "goto_symbol"),
         ("Goto Line…", "goto_line"),
+        ("Goto Definition", "goto_definition"),
         ("Goto Word…", "goto_word"),
         ("Jump to Matching Bracket", "move_to_bracket"),
         ("Bookmarks: Toggle", "toggle_bookmark"),
@@ -105,7 +106,7 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
         ("Next File", "next_view"),
         ("Previous File", "prev_view"),
     ]),
-    ("Tools", &[("Command Palette…", "show_overlay_command")]),
+    ("Tools", &[("Command Palette…", "show_overlay_command"), ("Format File (LSP)", "lsp_format"), ("Restart Language Servers", "lsp_restart")]),
     ("Help", &[("Check for Updates…", "check_for_updates")]),
     ("Preferences", &[
         ("Select Color Scheme…", "select_theme"),

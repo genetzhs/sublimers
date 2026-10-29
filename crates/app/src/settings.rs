@@ -20,6 +20,8 @@ pub struct Settings {
     pub rulers: Vec<usize>,
     pub trim_trailing_white_space_on_save: bool,
     pub auto_match_enabled: bool,
+    /// Start language servers (rust-analyzer, pylsp, gopls, clangd...) found on PATH.
+    pub lsp_enabled: bool,
     #[serde(skip)]
     pub keymap: Vec<Binding>,
 }
@@ -38,6 +40,7 @@ impl Default for Settings {
             rulers: vec![],
             trim_trailing_white_space_on_save: false,
             auto_match_enabled: true,
+            lsp_enabled: true,
             keymap: default_keymap(),
         }
     }
@@ -201,6 +204,8 @@ fn default_keymap() -> Vec<Binding> {
         ("ctrl+k, ctrl+3", "fold_level_3"),
         ("ctrl+k, ctrl+4", "fold_level_4"),
         // Bookmarks
+        ("f12", "goto_definition"),
+        ("ctrl+alt+f", "lsp_format"),
         ("ctrl+f2", "toggle_bookmark"),
         ("f2", "next_bookmark"),
         ("shift+f2", "prev_bookmark"),

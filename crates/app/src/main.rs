@@ -1,5 +1,6 @@
 mod editor;
 mod git;
+mod lsp;
 mod palette;
 mod session;
 mod settings;
@@ -8,7 +9,7 @@ mod updater;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use sublimers_core::{Buffer, Query};
+use sublimers_core::{Buffer, Change, Query, Selection};
 use sublimers_syntax::{DocHighlight, Syntaxes};
 
 use palette::{Palette, PaletteMode};
@@ -37,14 +38,41 @@ pub struct Doc {
     pub git_base: Option<Option<String>>,
     /// Changed-line markers and the buffer version they were computed for.
     pub git_marks: (u64, Vec<Option<git::LineChange>>),
+    /// Language server diagnostics for this file.
+    pub diagnostics: Vec<lsp::Diagnostic>,
+    /// Requests the editor view wants sent to the language server.
+    pub lsp_req: Vec<LspReq>,
+    /// Hover text from the language server and the char position it describes.
+    pub hover: Option<(usize, String)>,
+    /// Workspace root for the language server: None = not resolved yet.
+    pub lsp_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LspReq {
+    Completion(usize),
+    Hover(usize),
+    Definition(usize),
+    Format,
 }
 
 impl Doc {
     fn new(buf: Buffer, hl: DocHighlight, group: usize) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self { id, buf, hl, reveal: false, scroll: Default::default(), group, rows: Default::default(), completion: None, words: (0, Vec::new()), preview: false, disk_conflict: false, disk_deleted: false, git_base: None, git_marks: (u64::MAX, Vec::new()) }
+        Self { id, buf, hl, reveal: false, scroll: Default::default(), group, rows: Default::default(), completion: None, words: (0, Vec::new()), preview: false, disk_conflict: false, disk_deleted: false, git_base: None, git_marks: (u64::MAX, Vec::new()), diagnostics: Vec::new(), lsp_req: Vec::new(), hover: None, lsp_root: None }
     }
+}
+
+/// The workspace a language server should index for `file`: the git repository, else the
+/// nearest directory with a project marker, else the file's directory.
+fn lsp_root_for(file: &Path) -> PathBuf {
+    let dir = file.parent().unwrap_or(Path::new("/"));
+    if let Some(r) = git::repo_root(dir) {
+        return r;
+    }
+    const MARKERS: &[&str] = &["Cargo.toml", "go.mod", "package.json", "pyproject.toml", "setup.py", "compile_commands.json"];
+    dir.ancestors().find(|a| MARKERS.iter().any(|m| a.join(m).exists())).unwrap_or(dir).to_path_buf()
 }
 
 /// Split-view layout (Sublime's View → Layout).
@@ -131,6 +159,8 @@ pub struct App {
     dialog_rx: Option<std::sync::mpsc::Receiver<DialogResult>>,
     git_status: std::collections::HashMap<PathBuf, git::FileStatus>,
     git_head: Option<String>,
+    lsp: lsp::Manager,
+    last_lsp_sync: std::time::Instant,
     git_rx: Option<std::sync::mpsc::Receiver<(std::collections::HashMap<PathBuf, git::FileStatus>, Option<String>)>>,
     last_git_check: Option<std::time::Instant>,
 }
@@ -197,6 +227,8 @@ impl App {
             dialog_rx: None,
             git_status: Default::default(),
             git_head: None,
+            lsp: Default::default(),
+            last_lsp_sync: std::time::Instant::now(),
             git_rx: None,
             last_git_check: None,
         };
@@ -425,6 +457,7 @@ impl App {
         match doc.buf.save_as(path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
+                self.lsp.did_save(path);
                 doc.preview = false;
                 doc.disk_deleted = false;
                 if doc.hl.syntax_name == "Plain Text" {
@@ -433,6 +466,140 @@ impl App {
                 }
             }
             Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    /// Send pending language-server requests and apply the answers.
+    fn pump_lsp(&mut self) {
+        if !self.settings.lsp_enabled {
+            for d in &mut self.docs {
+                d.lsp_req.clear();
+            }
+            return;
+        }
+        // Full-text sync on every keystroke is wasteful; batch edits unless a request needs fresh text.
+        let sync_due = self.last_lsp_sync.elapsed().as_millis() >= 300;
+        if sync_due {
+            self.last_lsp_sync = std::time::Instant::now();
+        }
+        for i in 0..self.docs.len() {
+            let visible = self.group_active.contains(&Some(i));
+            let d = &mut self.docs[i];
+            let Some(path) = d.buf.path.clone() else {
+                d.lsp_req.clear();
+                continue;
+            };
+            if lsp::spec_for(&d.hl.syntax_name).is_none() {
+                d.lsp_req.clear();
+                continue;
+            }
+            if d.lsp_req.is_empty() && !(visible && sync_due) {
+                continue;
+            }
+            let root = d.lsp_root.get_or_insert_with(|| lsp_root_for(&path)).clone();
+            let Some((c, lang)) = self.lsp.client_for(&d.hl.syntax_name, &root) else {
+                d.lsp_req.clear();
+                continue;
+            };
+            let buf = &d.buf;
+            c.sync(&path, lang, || buf.text(), buf.version);
+            let enc = c.encoding;
+            for r in std::mem::take(&mut d.lsp_req) {
+                let at = |p: usize| {
+                    let line = d.buf.line_of(p);
+                    (line, lsp::to_server_col(&d.buf.line_text(line), p - d.buf.line_start(line), enc))
+                };
+                match r {
+                    LspReq::Completion(p) => {
+                        let (l, col) = at(p);
+                        c.completion(d.id, &path, l, col);
+                    }
+                    LspReq::Hover(p) => {
+                        let (l, col) = at(p);
+                        c.hover(d.id, p, &path, l, col);
+                    }
+                    LspReq::Definition(p) => {
+                        let (l, col) = at(p);
+                        c.definition(&path, l, col);
+                    }
+                    LspReq::Format => c.format(d.id, d.buf.version, &path, d.buf.tab_size, d.buf.translate_tabs),
+                }
+            }
+        }
+        let to_pos = |b: &Buffer, v: &serde_json::Value, enc: lsp::Encoding| -> Option<usize> {
+            let l = v["line"].as_u64()? as usize;
+            if l >= b.rope.len_lines() {
+                return Some(b.len());
+            }
+            let c = v["character"].as_u64()? as usize;
+            Some(b.line_start(l) + lsp::from_server_col(&b.line_text(l), c, enc))
+        };
+        for e in self.lsp.poll() {
+            match e {
+                lsp::Event::Status(s) => self.status = s,
+                lsp::Event::Completion { doc, items } => {
+                    let Some(d) = self.docs.iter_mut().find(|d| d.id == doc) else { continue };
+                    let Some(s) = d.buf.sels.last().copied().filter(|s| s.is_empty()) else { continue };
+                    let prefix = d.buf.prefix_at(s.head);
+                    let before = s.head.checked_sub(1).and_then(|p| d.buf.rope.get_char(p));
+                    // Stale answer: the caret left the word or member access it was asked for.
+                    if prefix.is_empty() && !matches!(before, Some('.' | ':')) {
+                        continue;
+                    }
+                    let all: Vec<String> = items.into_iter().map(|it| it.insert).filter(|w| !w.is_empty()).collect();
+                    let shown = editor::filter_lsp(&all, &prefix);
+                    if !shown.is_empty() {
+                        d.completion = Some(editor::Completion { items: shown, selected: 0, lsp: all });
+                    }
+                }
+                lsp::Event::Hover { doc, pos, text } => {
+                    if let Some(d) = self.docs.iter_mut().find(|d| d.id == doc) {
+                        if d.hover.as_ref().is_some_and(|(p, _)| *p == pos) {
+                            d.hover = Some((pos, text));
+                        }
+                    }
+                }
+                lsp::Event::Definition { path, line, col_server, enc } => {
+                    self.open_file(&path);
+                    let d = &mut self.docs[self.active];
+                    if d.buf.path.as_deref().is_some_and(|p| p == path.canonicalize().unwrap_or(path.clone())) {
+                        let l = line.min(d.buf.rope.len_lines() - 1);
+                        let p = d.buf.line_start(l) + lsp::from_server_col(&d.buf.line_text(l), col_server, enc);
+                        d.buf.sels = vec![Selection::caret(p)];
+                        d.reveal = true;
+                    }
+                }
+                lsp::Event::Diagnostics { path, raw, enc } => {
+                    for d in self.docs.iter_mut().filter(|d| d.buf.path.as_deref() == Some(path.as_path())) {
+                        let b = &d.buf;
+                        d.diagnostics = lsp::convert_diagnostics(&raw, enc, |l| (l < b.rope.len_lines()).then(|| b.line_text(l)));
+                    }
+                }
+                lsp::Event::Format { doc, version, edits, enc } => {
+                    let Some(d) = self.docs.iter_mut().find(|d| d.id == doc && d.buf.version == version) else { continue };
+                    let changes: Vec<Change> = edits
+                        .iter()
+                        .filter_map(|e| {
+                            let start = to_pos(&d.buf, &e["range"]["start"], enc)?;
+                            let end = to_pos(&d.buf, &e["range"]["end"], enc)?;
+                            Some(Change { start, end, text: e["newText"].as_str()?.to_string() })
+                        })
+                        .collect();
+                    if changes.is_empty() {
+                        self.status = "Already formatted".into();
+                        continue;
+                    }
+                    let sels = d.buf.sels.clone();
+                    let len = d.buf.len();
+                    d.buf.transact(changes, sels, None);
+                    // Keep carets inside the (possibly shorter) text.
+                    let n = d.buf.len();
+                    for s in &mut d.buf.sels {
+                        *s = Selection::caret(s.head.min(n).min(len.max(n)));
+                    }
+                    self.status = "Formatted".into();
+                }
+            }
         }
     }
 
@@ -526,6 +693,7 @@ impl App {
             return;
         }
         if let Some(p) = self.docs[i].buf.path.clone() {
+            self.lsp.did_close(&p);
             self.closed.push(p);
         }
         let g = self.docs[i].group;
@@ -920,6 +1088,11 @@ impl App {
             "clear_bookmarks" => b.clear_bookmarks(),
             "select_all_bookmarks" => b.select_bookmarks(),
             "auto_complete" => editor::trigger_completion(d),
+            "goto_definition" => {
+                let h = d.buf.sels.last().unwrap().head;
+                d.lsp_req.push(LspReq::Definition(h));
+            }
+            "lsp_format" => d.lsp_req.push(LspReq::Format),
             "copy" | "cut" => {
                 if b.sels.iter().all(|s| s.is_empty()) {
                     let saved = b.sels.clone();
@@ -944,6 +1117,13 @@ impl App {
             }
             "new_window" => session::spawn_window(&["--new-window".as_ref()]),
             "check_for_updates" => self.check_updates(true),
+            "lsp_restart" => {
+                self.lsp = Default::default();
+                for d in &mut self.docs {
+                    d.diagnostics.clear();
+                }
+                self.status = "Language servers restarted".into();
+            }
             "close_window" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             "set_layout_1" => self.set_layout(Layout::Single),
             "set_layout_2" => self.set_layout(Layout::Columns(2)),
@@ -1489,6 +1669,14 @@ impl eframe::App for App {
                 d.preview = false;
             }
         }
+        if self.pending_close.is_some() {
+            // The save dialog is modal: keys go to it, not to the editor behind it.
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
         // Global keybindings (only when no text field other than the editor has focus).
         let typing_elsewhere = ctx.wants_keyboard_input() && !editor::editor_has_focus(ctx);
         let cmds = settings::match_keys(ctx, &self.settings.keymap, typing_elsewhere);
@@ -1536,7 +1724,13 @@ impl eframe::App for App {
                 let syntax = d.hl.syntax_name.clone();
                 let indent = if d.buf.translate_tabs { format!("Spaces: {}", d.buf.tab_size) } else { format!("Tab Size: {}", d.buf.tab_size) };
                 let (cur_le, cur_enc) = (d.buf.line_ending, d.buf.encoding.clone());
+                let errs = d.diagnostics.iter().filter(|x| x.severity == lsp::Severity::Error).count();
+                let warns = d.diagnostics.iter().filter(|x| x.severity == lsp::Severity::Warning).count();
                 ui.label(info);
+                if errs + warns > 0 {
+                    ui.label(egui::RichText::new(format!("{errs} errors")).color(if errs > 0 { egui::Color32::from_rgb(0xf0, 0x55, 0x5a) } else { ui.visuals().weak_text_color() }));
+                    ui.label(egui::RichText::new(format!("{warns} warnings")).color(if warns > 0 { egui::Color32::from_rgb(0xe5, 0xc0, 0x4b) } else { ui.visuals().weak_text_color() }));
+                }
                 ui.label(&self.status);
                 if let UpdateState::Available(r) = &self.update {
                     if ui.link(format!("⬆ Update {} available", r.version)).clicked() {
@@ -1638,7 +1832,7 @@ impl eframe::App for App {
                     gui.advance_cursor_after_rect(bar);
                 }
                 Self::update_git_marks(&mut self.docs[di]);
-                let want_focus = g == self.focus && !self.palette.open && !self.find.focus;
+                let want_focus = g == self.focus && !self.palette.open && !self.find.focus && self.pending_close.is_none();
                 let vr = editor::show(&mut gui, &mut self.docs[di], editor::ViewArgs { syn: &self.syn, theme: &theme, st: &self.settings, group: g, want_focus });
                 if vr.focused && self.active != di {
                     self.active = di;
@@ -1668,29 +1862,99 @@ impl eframe::App for App {
         self.file_dialog(ctx);
         self.poll_dialog(ctx);
         self.poll_git();
+        self.pump_lsp();
+        if self.lsp.any_running() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(150));
+        }
         self.update_ui(ctx);
 
         if let Some(i) = self.pending_close {
-            let mut done = false;
-            egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label(format!("Save changes to {} before closing?", self.docs[i].buf.name()));
-                ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+            #[derive(PartialEq)]
+            enum Choice {
+                Save,
+                Discard,
+                Cancel,
+            }
+            let mut choice = ctx.input_mut(|inp| {
+                if inp.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                    Some(Choice::Cancel)
+                } else if inp.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    Some(Choice::Save)
+                } else {
+                    None
+                }
+            });
+            let screen = ctx.screen_rect();
+            // Dim everything behind the dialog; clicking outside cancels.
+            egui::Area::new(egui::Id::new("unsaved_backdrop")).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
+                let r = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
+                if r.clicked() {
+                    choice = Some(Choice::Cancel);
+                }
+            });
+            let name = self.docs[i].buf.name();
+            let accent = egui::Color32::from_rgb(0xff, 0x9a, 0x3d);
+            egui::Area::new(egui::Id::new("unsaved_dialog")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                let v = ui.visuals().clone();
+                egui::Frame::new()
+                    .fill(v.window_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color))
+                    .corner_radius(14.0)
+                    .shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: egui::Color32::from_black_alpha(110) })
+                    .inner_margin(egui::Margin::same(28))
+                    .show(ui, |ui| {
+                        ui.set_width(440.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 22.0, accent.gamma_multiply(0.18));
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "!", egui::FontId::proportional(26.0), accent);
+                            ui.add_space(10.0);
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("Save changes?").size(21.0).strong());
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(format!("\"{name}\" has unsaved changes. They will be lost if you don't save them.")).size(14.5).color(v.text_color().gamma_multiply(0.75)));
+                            });
+                        });
+                        ui.add_space(24.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let btn = |text: &str, fill: Option<egui::Color32>| {
+                                let mut rt = egui::RichText::new(text).size(15.0);
+                                if fill.is_some() {
+                                    rt = rt.color(egui::Color32::BLACK).strong();
+                                }
+                                let mut b = egui::Button::new(rt).min_size(egui::vec2(110.0, 38.0)).corner_radius(8.0);
+                                if let Some(f) = fill {
+                                    b = b.fill(f);
+                                }
+                                b
+                            };
+                            if ui.add(btn("Save", Some(accent))).clicked() {
+                                choice = Some(Choice::Save);
+                            }
+                            if ui.add(btn("Cancel", None)).clicked() {
+                                choice = Some(Choice::Cancel);
+                            }
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                let rt = egui::RichText::new("Don't Save").size(15.0).color(egui::Color32::from_rgb(0xf0, 0x6a, 0x6a));
+                                if ui.add(egui::Button::new(rt).frame(false).min_size(egui::vec2(100.0, 38.0))).clicked() {
+                                    choice = Some(Choice::Discard);
+                                }
+                            });
+                        });
+                    });
+            });
+            if let Some(c) = choice {
+                self.pending_close = None;
+                match c {
+                    Choice::Save => {
                         self.active = i;
                         self.save_doc(i, false, true);
-                        done = true;
                     }
-                    if ui.button("Don't Save").clicked() {
-                        self.close(i, true);
-                        done = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        done = true;
-                    }
-                });
-            });
-            if done {
-                self.pending_close = None;
+                    Choice::Discard => self.close(i, true),
+                    Choice::Cancel => {}
+                }
             }
         }
 
