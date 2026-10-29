@@ -1,0 +1,41 @@
+[package]
+name = "sublimers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sublimers"
+path = "src/main.rs"
+
+[dependencies]
+sublimers-core = { path = "../core" }
+sublimers-syntax = { path = "../syntax" }
+eframe = "0.31"
+rfd = "0.15"
+ignore = "0.4"
+nucleo-matcher = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+regex = "1"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+arboard = { version = "3", default-features = false }
+trash = "5"
+ureq = "2"
+
+[package.metadata.generate-rpm]
+name = "sublimers"
+summary = "Fast, Sublime Text-style code editor written in Rust"
+url = "https://github.com/genetzhs/sublimers"
+assets = [
+    { source = "target/release/sublimers", dest = "/usr/bin/sublimers", mode = "755" },
+    { source = "packaging/sublimers.desktop", dest = "/usr/share/applications/sublimers.desktop", mode = "644" },
+    { source = "packaging/sublimers-512.png", dest = "/usr/share/icons/hicolor/512x512/apps/sublimers.png", mode = "644" },
+    { source = "packaging/sublimers.png", dest = "/usr/share/icons/hicolor/256x256/apps/sublimers.png", mode = "644" },
+    { source = "packaging/sublimers.svg", dest = "/usr/share/icons/hicolor/scalable/apps/sublimers.svg", mode = "644" },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/sublimers/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/sublimers/LICENSE-APACHE", mode = "644", doc = true },
+]

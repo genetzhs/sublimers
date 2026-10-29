@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sublimers
+GenericName=Text Editor
+Comment=Fast, Sublime-style text editor written in Rust
+Exec=sublimers %F
+Icon=sublimers
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;
+StartupWMClass=sublimers
