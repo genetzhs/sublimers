@@ -94,14 +94,28 @@ impl Layout {
         }
     }
 
-    fn rects(self, r: egui::Rect) -> Vec<egui::Rect> {
-        let n = self.groups();
+    /// Draggable divider positions as fractions: (vertical dividers, horizontal dividers).
+    fn default_splits(self) -> (Vec<f32>, Vec<f32>) {
+        let even = |n: usize| (1..n).map(|i| i as f32 / n as f32).collect();
+        match self {
+            Layout::Single => (vec![], vec![]),
+            Layout::Columns(n) => (even(n), vec![]),
+            Layout::Rows(n) => (vec![], even(n)),
+            Layout::Grid => (vec![0.5], vec![0.5]),
+        }
+    }
+
+    fn rects(self, r: egui::Rect, xs: &[f32], ys: &[f32]) -> Vec<egui::Rect> {
+        let edges = |v: &[f32]| -> Vec<f32> { std::iter::once(0.0).chain(v.iter().copied()).chain(std::iter::once(1.0)).collect() };
+        let (ex, ey) = (edges(xs), edges(ys));
+        let x = |f: f32| r.left() + r.width() * f;
+        let y = |f: f32| r.top() + r.height() * f;
         match self {
             Layout::Single => vec![r],
-            Layout::Columns(_) => (0..n).map(|i| egui::Rect::from_min_max(egui::pos2(r.left() + r.width() * i as f32 / n as f32, r.top()), egui::pos2(r.left() + r.width() * (i + 1) as f32 / n as f32, r.bottom()))).collect(),
-            Layout::Rows(_) => (0..n).map(|i| egui::Rect::from_min_max(egui::pos2(r.left(), r.top() + r.height() * i as f32 / n as f32), egui::pos2(r.right(), r.top() + r.height() * (i + 1) as f32 / n as f32))).collect(),
+            Layout::Columns(_) => ex.windows(2).map(|w| egui::Rect::from_min_max(egui::pos2(x(w[0]), r.top()), egui::pos2(x(w[1]), r.bottom()))).collect(),
+            Layout::Rows(_) => ey.windows(2).map(|w| egui::Rect::from_min_max(egui::pos2(r.left(), y(w[0])), egui::pos2(r.right(), y(w[1])))).collect(),
             Layout::Grid => {
-                let c = r.center();
+                let c = egui::pos2(x(xs.first().copied().unwrap_or(0.5)), y(ys.first().copied().unwrap_or(0.5)));
                 vec![
                     egui::Rect::from_min_max(r.min, c),
                     egui::Rect::from_min_max(egui::pos2(c.x, r.top()), egui::pos2(r.right(), c.y)),
@@ -160,6 +174,12 @@ pub struct App {
     git_status: std::collections::HashMap<PathBuf, git::FileStatus>,
     git_head: Option<String>,
     lsp: lsp::Manager,
+    /// Divider positions of the split layout (fractions), see `Layout::default_splits`.
+    splits: (Vec<f32>, Vec<f32>),
+    /// Tab being dragged, and the tab rectangles and group rectangles of the last frame.
+    drag_tab: Option<usize>,
+    tab_rects: Vec<(usize, egui::Rect)>,
+    group_rects: Vec<egui::Rect>,
     last_lsp_sync: std::time::Instant,
     git_rx: Option<std::sync::mpsc::Receiver<(std::collections::HashMap<PathBuf, git::FileStatus>, Option<String>)>>,
     last_git_check: Option<std::time::Instant>,
@@ -228,6 +248,10 @@ impl App {
             git_status: Default::default(),
             git_head: None,
             lsp: Default::default(),
+            splits: (vec![], vec![]),
+            drag_tab: None,
+            tab_rects: Vec::new(),
+            group_rects: Vec::new(),
             last_lsp_sync: std::time::Instant::now(),
             git_rx: None,
             last_git_check: None,
@@ -744,6 +768,7 @@ impl App {
 
     fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
+        self.splits = layout.default_splits();
         let n = layout.groups();
         for d in &mut self.docs {
             d.group = d.group.min(n - 1);
@@ -1306,7 +1331,11 @@ impl App {
                     let name = d.buf.name();
                     let font = egui::FontId::proportional(13.0);
                     let tw = ui.fonts(|f| f.layout_no_wrap(name.clone(), font.clone(), egui::Color32::WHITE).size().x);
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(tw + 46.0 + if d.buf.is_dirty() { 14.0 } else { 0.0 }, 30.0), egui::Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(tw + 46.0 + if d.buf.is_dirty() { 14.0 } else { 0.0 }, 30.0), egui::Sense::click_and_drag());
+                    self.tab_rects.push((i, rect));
+                    if resp.drag_started() {
+                        self.drag_tab = Some(i);
+                    }
                     let vis = ui.visuals();
                     let fill = if active { editor_bg } else if resp.hovered() { vis.widgets.hovered.weak_bg_fill } else { egui::Color32::TRANSPARENT };
                     ui.painter().rect_filled(rect, egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, fill);
@@ -1368,6 +1397,121 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Draggable dividers between split groups.
+    fn split_dividers(&mut self, ctx: &egui::Context) {
+        let Some(area) = self.group_rects.iter().copied().reduce(|a, b| a.union(b)) else { return };
+        let fill = ctx.style().visuals.widgets.hovered.bg_stroke.color;
+        let accent = egui::Color32::from_rgb(0x4f, 0x9c, 0xff);
+        egui::Area::new(egui::Id::new("split_dividers")).order(egui::Order::Middle).fixed_pos(area.min).interactable(true).show(ctx, |ui| {
+            for vertical in [true, false] {
+                let n = if vertical { self.splits.0.len() } else { self.splits.1.len() };
+                for k in 0..n {
+                    let f = if vertical { self.splits.0[k] } else { self.splits.1[k] };
+                    let hit = if vertical {
+                        let x = area.left() + area.width() * f;
+                        egui::Rect::from_min_max(egui::pos2(x - 4.0, area.top()), egui::pos2(x + 4.0, area.bottom()))
+                    } else {
+                        let y = area.top() + area.height() * f;
+                        egui::Rect::from_min_max(egui::pos2(area.left(), y - 4.0), egui::pos2(area.right(), y + 4.0))
+                    };
+                    let resp = ui.interact(hit, egui::Id::new(("divider", vertical, k)), egui::Sense::drag());
+                    if resp.hovered() || resp.dragged() {
+                        ctx.set_cursor_icon(if vertical { egui::CursorIcon::ResizeHorizontal } else { egui::CursorIcon::ResizeVertical });
+                        let line = if vertical { egui::Rect::from_center_size(hit.center(), egui::vec2(2.0, hit.height())) } else { egui::Rect::from_center_size(hit.center(), egui::vec2(hit.width(), 2.0)) };
+                        ui.painter().rect_filled(line, 1.0, if resp.dragged() { accent } else { fill });
+                    }
+                    if resp.dragged() {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            let v = if vertical { &mut self.splits.0 } else { &mut self.splits.1 };
+                            let lo = if k == 0 { 0.0 } else { v[k - 1] } + 0.08;
+                            let hi = v.get(k + 1).copied().unwrap_or(1.0) - 0.08;
+                            let raw = if vertical { (p.x - area.left()) / area.width() } else { (p.y - area.top()) / area.height() };
+                            v[k] = raw.clamp(lo, hi.max(lo));
+                        }
+                    }
+                    if resp.double_clicked() {
+                        self.splits = self.layout.default_splits();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Dragging a tab: reorder within its pane or drop it on another pane.
+    fn tab_drag(&mut self, ctx: &egui::Context) {
+        let Some(from) = self.drag_tab.filter(|&i| i < self.docs.len()) else {
+            self.drag_tab = None;
+            return;
+        };
+        let Some(p) = ctx.pointer_latest_pos() else { return };
+        let released = ctx.input(|i| !i.pointer.primary_down());
+        let target_group = self.group_rects.iter().position(|r| r.contains(p));
+        // Insert before the first tab of the target group whose centre is right of the pointer.
+        let before = target_group.and_then(|g| self.tab_rects.iter().find(|(i, r)| self.docs.get(*i).is_some_and(|d| d.group == g) && r.center().x > p.x && (r.top() - 20.0..r.bottom() + 20.0).contains(&p.y)).map(|(i, _)| *i));
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tab_drag")));
+        let accent = egui::Color32::from_rgb(0x4f, 0x9c, 0xff);
+        if let Some(g) = target_group {
+            let gr = self.group_rects[g];
+            let in_strip = p.y < gr.top() + 40.0;
+            if in_strip {
+                let x = before.and_then(|b| self.tab_rects.iter().find(|(i, _)| *i == b)).map(|(_, r)| r.left() - 1.0)
+                    .or_else(|| self.tab_rects.iter().filter(|(i, _)| self.docs.get(*i).is_some_and(|d| d.group == g)).map(|(_, r)| r.right() + 1.0).reduce(f32::max))
+                    .unwrap_or(gr.left() + 6.0);
+                painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x - 1.0, gr.top() + 4.0), egui::pos2(x + 1.0, gr.top() + 34.0)), 1.0, accent);
+            } else if self.docs[from].group != g {
+                painter.rect_filled(gr.shrink(2.0), 6.0, accent.gamma_multiply(0.12));
+                painter.rect_stroke(gr.shrink(2.0), 6.0, egui::Stroke::new(2.0_f32, accent), egui::StrokeKind::Inside);
+            }
+        }
+        let name = self.docs[from].buf.name();
+        let galley = ctx.fonts(|f| f.layout_no_wrap(name, egui::FontId::proportional(13.0), egui::Color32::WHITE));
+        let r = egui::Rect::from_min_size(p + egui::vec2(12.0, 8.0), galley.size() + egui::vec2(20.0, 12.0));
+        painter.rect_filled(r, 6.0, accent.gamma_multiply(0.85));
+        painter.galley(r.min + egui::vec2(10.0, 6.0), galley, egui::Color32::WHITE);
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        if !released {
+            return;
+        }
+        self.drag_tab = None;
+        let Some(g) = target_group else { return };
+        self.docs[from].group = g;
+        let to = match before {
+            Some(b) if b == from => from,
+            Some(b) => if b > from { b - 1 } else { b },
+            None => self.docs.iter().enumerate().filter(|(i, d)| d.group == g && *i != from).map(|(i, _)| if i > from { i } else { i + 1 }).max().unwrap_or(from).min(self.docs.len() - 1),
+        };
+        self.move_doc(from, to);
+        self.active = to;
+        self.sync_groups();
+    }
+
+    /// Move a tab within `docs`, keeping every stored index pointing at the same tab.
+    fn move_doc(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        let d = self.docs.remove(from);
+        self.docs.insert(to, d);
+        let map = |i: usize| -> usize {
+            if i == from {
+                to
+            } else if from < to && i > from && i <= to {
+                i - 1
+            } else if to < from && i >= to && i < from {
+                i + 1
+            } else {
+                i
+            }
+        };
+        self.active = map(self.active);
+        for ga in self.group_active.iter_mut().flatten() {
+            *ga = map(*ga);
+        }
+        if let Some(pc) = self.pending_close.as_mut() {
+            *pc = map(*pc);
+        }
     }
 
     fn tab_command(&mut self, ctx: &egui::Context, i: usize, cmd: &str) {
@@ -1800,7 +1944,13 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
             let theme = self.syn.theme(&self.settings.color_scheme).clone();
-            let rects = self.layout.rects(ui.available_rect_before_wrap());
+            let area = ui.available_rect_before_wrap();
+            if self.splits.0.len() + self.splits.1.len() != { let d = self.layout.default_splits(); d.0.len() + d.1.len() } {
+                self.splits = self.layout.default_splits();
+            }
+            let rects = self.layout.rects(area, &self.splits.0, &self.splits.1);
+            self.group_rects = rects.clone();
+            self.tab_rects.clear();
             let sep = ctx.style().visuals.panel_fill;
             for (g, r) in rects.into_iter().enumerate() {
                 let r = if self.layout.groups() > 1 { r.shrink(1.0) } else { r };
@@ -1849,7 +1999,7 @@ impl eframe::App for App {
             }
             if self.layout.groups() > 1 {
                 // Focused pane indicator.
-                let rects = self.layout.rects(ui.max_rect());
+                let rects = self.group_rects.clone();
                 if let Some(r) = rects.get(self.focus) {
                     ui.painter().rect_stroke(r.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x4f, 0x9c, 0xff).gamma_multiply(0.6)), egui::StrokeKind::Inside);
                 }
@@ -1957,6 +2107,9 @@ impl eframe::App for App {
                 }
             }
         }
+
+        self.split_dividers(ctx);
+        self.tab_drag(ctx);
 
         // Drag & drop files
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
