@@ -66,21 +66,21 @@ chmod +x Sublimers-x86_64.AppImage
 ### Debian / Ubuntu / Linux Mint (.deb)
 
 ```sh
-sudo apt install ./sublimers_0.1.0_amd64.deb
+sudo apt install ./sublimers_0.1.1_amd64.deb
 ```
 
 ### Fedora / RHEL / openSUSE (.rpm)
 
 ```sh
-sudo dnf install ./sublimers-0.1.0-1.x86_64.rpm      # Fedora, RHEL
-sudo zypper install ./sublimers-0.1.0-1.x86_64.rpm   # openSUSE
+sudo dnf install ./sublimers-0.1.1-1.x86_64.rpm      # Fedora, RHEL
+sudo zypper install ./sublimers-0.1.1-1.x86_64.rpm   # openSUSE
 ```
 
 ### Other distributions (.tar.gz)
 
 ```sh
-tar xzf sublimers-0.1.0-x86_64-linux.tar.gz
-./sublimers-0.1.0-x86_64-linux/sublimers
+tar xzf sublimers-0.1.1-x86_64-linux.tar.gz
+./sublimers-0.1.1-x86_64-linux/sublimers
 ```
 
 Verify downloads with `sha256sum -c SHA256SUMS`.

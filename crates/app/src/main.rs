@@ -14,6 +14,8 @@ use palette::{Palette, PaletteMode};
 use settings::Settings;
 
 pub struct Doc {
+    /// Stable identity, so async results (e.g. a Save As dialog) find the right tab.
+    pub id: u64,
     pub buf: Buffer,
     pub hl: DocHighlight,
     /// Request to scroll the primary caret into view on next frame.
@@ -34,7 +36,9 @@ pub struct Doc {
 
 impl Doc {
     fn new(buf: Buffer, hl: DocHighlight, group: usize) -> Self {
-        Self { buf, hl, reveal: false, scroll: Default::default(), group, rows: Default::default(), completion: None, words: (0, Vec::new()), preview: false, disk_conflict: false, disk_deleted: false }
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { id, buf, hl, reveal: false, scroll: Default::default(), group, rows: Default::default(), completion: None, words: (0, Vec::new()), preview: false, disk_conflict: false, disk_deleted: false }
     }
 }
 
@@ -118,6 +122,17 @@ pub struct App {
     update_rx: Option<std::sync::mpsc::Receiver<UpdateState>>,
     /// Show the update window (manual check); automatic checks only show a status-bar notice.
     update_window: bool,
+    /// Result of a native file dialog running on a background thread.
+    dialog_rx: Option<std::sync::mpsc::Receiver<DialogResult>>,
+}
+
+/// Native file dialogs run off the UI thread: a blocking dialog freezes the window, and
+/// after a few seconds the desktop offers to force-quit the "unresponsive" app.
+enum DialogResult {
+    Files(Vec<PathBuf>),
+    Folder(PathBuf),
+    SaveAs { doc: u64, path: PathBuf, close_after: bool },
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -170,6 +185,7 @@ impl App {
             update: UpdateState::Idle,
             update_rx: None,
             update_window: false,
+            dialog_rx: None,
         };
         trace("syntaxes loaded");
         match window {
@@ -363,29 +379,86 @@ impl App {
     }
 
     fn save(&mut self, save_as: bool) {
-        let doc = &mut self.docs[self.active];
-        let path = if save_as || doc.buf.path.is_none() {
-            let mut d = rfd::FileDialog::new().set_file_name(doc.buf.name());
-            if let Some(r) = &self.root {
-                d = d.set_directory(r);
-            }
-            d.save_file()
-        } else {
-            doc.buf.path.clone()
-        };
-        let Some(path) = path else { return };
+        self.save_doc(self.active, save_as, false);
+    }
+
+    /// Save tab `i`, asking for a path (asynchronously) when needed.
+    fn save_doc(&mut self, i: usize, save_as: bool, close_after: bool) {
+        let doc = &self.docs[i];
+        if save_as || doc.buf.path.is_none() {
+            let (id, name) = (doc.id, doc.buf.name());
+            let dir = doc.buf.path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).or_else(|| self.root.clone());
+            self.run_dialog(move || {
+                let mut d = rfd::FileDialog::new().set_file_name(name);
+                if let Some(dir) = dir {
+                    d = d.set_directory(dir);
+                }
+                d.save_file().map_or(DialogResult::Cancelled, |path| DialogResult::SaveAs { doc: id, path, close_after })
+            });
+            return;
+        }
+        let path = doc.buf.path.clone().unwrap();
+        self.write_doc(i, &path);
+        if close_after && !self.docs[i].buf.is_dirty() {
+            self.close(i, true);
+        }
+    }
+
+    fn write_doc(&mut self, i: usize, path: &Path) {
+        let doc = &mut self.docs[i];
         if self.settings.trim_trailing_white_space_on_save {
             trim_trailing(&mut doc.buf);
         }
-        match doc.buf.save_as(&path) {
+        match doc.buf.save_as(path) {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
+                doc.preview = false;
+                doc.disk_deleted = false;
                 if doc.hl.syntax_name == "Plain Text" {
                     let first = doc.buf.line_text(0);
-                    doc.hl.set_syntax(self.syn.detect(Some(&path), &first));
+                    doc.hl.set_syntax(self.syn.detect(Some(path), &first));
                 }
             }
             Err(e) => self.status = format!("Save failed: {e}"),
+        }
+    }
+
+    fn run_dialog(&mut self, f: impl FnOnce() -> DialogResult + Send + 'static) {
+        if self.dialog_rx.is_some() {
+            return; // one dialog at a time
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dialog_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+    }
+
+    fn poll_dialog(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.dialog_rx else { return };
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        let r = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => DialogResult::Cancelled,
+        };
+        self.dialog_rx = None;
+        match r {
+            DialogResult::Files(ps) => {
+                for p in ps {
+                    self.open_file(&p);
+                }
+            }
+            DialogResult::Folder(p) => self.open_folder(&p),
+            DialogResult::SaveAs { doc, path, close_after } => {
+                if let Some(i) = self.docs.iter().position(|d| d.id == doc) {
+                    self.write_doc(i, &path);
+                    if close_after && !self.docs[i].buf.is_dirty() {
+                        self.close(i, true);
+                    }
+                }
+            }
+            DialogResult::Cancelled => {}
         }
     }
 
@@ -746,16 +819,17 @@ impl App {
         match cmd {
             "new_file" => self.new_file(),
             "open_file" => {
-                if let Some(ps) = rfd::FileDialog::new().pick_files() {
-                    for p in ps {
-                        self.open_file(&p);
+                let dir = self.root.clone();
+                self.run_dialog(move || {
+                    let mut d = rfd::FileDialog::new();
+                    if let Some(dir) = dir {
+                        d = d.set_directory(dir);
                     }
-                }
+                    d.pick_files().map_or(DialogResult::Cancelled, DialogResult::Files)
+                });
             }
             "open_folder" => {
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    self.open_folder(&p);
-                }
+                self.run_dialog(|| rfd::FileDialog::new().pick_folder().map_or(DialogResult::Cancelled, DialogResult::Folder));
             }
             "save" => self.save(false),
             "save_as" => self.save(true),
@@ -1518,6 +1592,7 @@ impl eframe::App for App {
             palette::show(ctx, self);
         }
         self.file_dialog(ctx);
+        self.poll_dialog(ctx);
         self.update_ui(ctx);
 
         if let Some(i) = self.pending_close {
@@ -1527,10 +1602,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
                         self.active = i;
-                        self.save(false);
-                        if !self.docs[i].buf.is_dirty() {
-                            self.close(i, true);
-                        }
+                        self.save_doc(i, false, true);
                         done = true;
                     }
                     if ui.button("Don't Save").clicked() {
