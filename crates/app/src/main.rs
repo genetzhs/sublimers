@@ -1,3 +1,4 @@
+mod build;
 mod editor;
 mod git;
 mod lsp;
@@ -46,6 +47,12 @@ pub struct Doc {
     pub hover: Option<(usize, String)>,
     /// Workspace root for the language server: None = not resolved yet.
     pub lsp_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BottomPanel {
+    Output,
+    Terminal,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -174,6 +181,15 @@ pub struct App {
     git_status: std::collections::HashMap<PathBuf, git::FileStatus>,
     git_head: Option<String>,
     lsp: lsp::Manager,
+    /// Bottom panel (build output / terminal) and its state.
+    panel: Option<BottomPanel>,
+    build: Option<build::Run>,
+    /// Name of the build system Ctrl+B uses (chosen with Ctrl+Shift+B).
+    build_choice: Option<String>,
+    build_menu: Option<Vec<build::BuildSystem>>,
+    build_error: Option<usize>,
+    /// Build systems from the open .sublime-project.
+    project_builds: Vec<build::BuildSystem>,
     /// Divider positions of the split layout (fractions), see `Layout::default_splits`.
     splits: (Vec<f32>, Vec<f32>),
     /// Tab being dragged, and the tab rectangles and group rectangles of the last frame.
@@ -248,6 +264,12 @@ impl App {
             git_status: Default::default(),
             git_head: None,
             lsp: Default::default(),
+            panel: None,
+            build: None,
+            build_choice: None,
+            build_menu: None,
+            build_error: None,
+            project_builds: Vec::new(),
             splits: (vec![], vec![]),
             drag_tab: None,
             tab_rects: Vec::new(),
@@ -1142,6 +1164,23 @@ impl App {
             }
             "new_window" => session::spawn_window(&["--new-window".as_ref()]),
             "check_for_updates" => self.check_updates(true),
+            "build" => self.run_build(None),
+            "build_with" => {
+                let v = self.build_systems();
+                if v.is_empty() {
+                    self.status = "No build system for this file".into();
+                } else {
+                    self.build_menu = Some(v);
+                }
+            }
+            "cancel_build" => {
+                if let Some(r) = self.build.as_mut() {
+                    r.cancel();
+                }
+            }
+            "next_result" => self.goto_build_error(true),
+            "prev_result" => self.goto_build_error(false),
+            "show_panel_output" => self.panel = if self.panel == Some(BottomPanel::Output) { None } else { Some(BottomPanel::Output) },
             "lsp_restart" => {
                 self.lsp = Default::default();
                 for d in &mut self.docs {
@@ -1231,6 +1270,8 @@ impl App {
                 } else if self.find.open || self.palette.open {
                     self.find.open = false;
                     self.palette.open = false;
+                } else if self.panel == Some(BottomPanel::Output) {
+                    self.panel = None;
                 } else {
                     b.single_selection();
                 }
@@ -1398,6 +1439,179 @@ impl App {
             });
         });
     }
+
+    fn build_systems(&self) -> Vec<build::BuildSystem> {
+        let d = &self.docs[self.active];
+        build::detect(d.buf.path.as_deref(), &d.hl.syntax_name, self.root.as_deref(), &self.project_builds)
+    }
+
+    /// Run the chosen build system (or the first that applies), saving modified files first.
+    fn run_build(&mut self, pick: Option<build::BuildSystem>) {
+        let systems = self.build_systems();
+        let bs = pick.or_else(|| self.build_choice.as_ref().and_then(|c| systems.iter().find(|b| &b.name == c).cloned())).or_else(|| systems.first().cloned());
+        let Some(bs) = bs else {
+            self.status = "No build system for this file".into();
+            return;
+        };
+        self.build_choice = Some(bs.name.clone());
+        for i in 0..self.docs.len() {
+            if self.docs[i].buf.is_dirty() && self.docs[i].buf.path.is_some() {
+                let p = self.docs[i].buf.path.clone().unwrap();
+                self.write_doc(i, &p);
+            }
+        }
+        let vars = build::Vars { file: self.docs[self.active].buf.path.clone(), folder: self.root.clone() };
+        self.build = None; // cancels a running build
+        match build::Run::start(&bs, &vars) {
+            Ok(r) => {
+                self.build = Some(r);
+                self.build_error = None;
+                self.panel = Some(BottomPanel::Output);
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn goto_build_error(&mut self, forward: bool) {
+        let Some(r) = self.build.as_ref() else { return };
+        let n = r.errors.len();
+        if n == 0 {
+            return;
+        }
+        let i = match self.build_error {
+            None => if forward { 0 } else { n - 1 },
+            Some(i) => if forward { (i + 1) % n } else { (i + n - 1) % n },
+        };
+        self.build_error = Some(i);
+        let e = r.errors[i].clone();
+        self.open_at(&e.path, e.line, e.col);
+    }
+
+    /// Open a file with the caret at (line, char column).
+    fn open_at(&mut self, path: &Path, line: usize, col: usize) {
+        self.open_file(path);
+        let d = &mut self.docs[self.active];
+        let l = line.min(d.buf.rope.len_lines() - 1);
+        let len = d.buf.line_text(l).chars().count();
+        let p = d.buf.line_start(l) + col.min(len);
+        d.buf.sels = vec![Selection::caret(p)];
+        d.reveal = true;
+        d.buf.reveal_carets();
+    }
+
+    fn output_panel(&mut self, ui: &mut egui::Ui) {
+        let weak = ui.visuals().weak_text_color();
+        let mut jump = None;
+        let mut close = false;
+        ui.horizontal(|ui| {
+            match self.build.as_ref() {
+                Some(r) => {
+                    ui.label(egui::RichText::new(&r.name).strong());
+                    let (txt, col) = match r.finished {
+                        None => (format!("Running… {:.0}s", r.started.elapsed().as_secs_f32()), egui::Color32::from_rgb(0x4f, 0x9c, 0xff)),
+                        Some((Some(0), t)) => (format!("Finished in {t:.1}s"), egui::Color32::from_rgb(0x8c, 0xc2, 0x65)),
+                        Some((Some(c), t)) => (format!("Exited with code {c} in {t:.1}s"), egui::Color32::from_rgb(0xf0, 0x55, 0x5a)),
+                        Some((None, t)) => (format!("Cancelled after {t:.1}s"), weak),
+                    };
+                    ui.label(egui::RichText::new(txt).color(col));
+                    if !r.errors.is_empty() {
+                        ui.label(egui::RichText::new(format!("{} locations · F4 next", r.errors.len())).color(weak));
+                    }
+                }
+                None => {
+                    ui.label(egui::RichText::new("Build output").strong());
+                    ui.label(egui::RichText::new("Ctrl+B to build, Ctrl+Shift+B to choose").color(weak));
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("×").on_hover_text("Close (Esc)").clicked() {
+                    close = true;
+                }
+                if self.build.as_ref().is_some_and(build::Run::running) {
+                    if ui.button("Cancel").clicked() {
+                        self.build.as_mut().unwrap().cancel();
+                    }
+                } else if self.build_choice.is_some() && ui.button("Rebuild").clicked() {
+                    jump = Some(None);
+                }
+            });
+        });
+        ui.separator();
+        let font = egui::FontId::monospace((self.settings.font_size - 1.0).max(9.0));
+        let row_h = ui.fonts(|f| f.row_height(&font));
+        if let Some(r) = self.build.as_ref() {
+            let err_lines: std::collections::HashMap<usize, usize> = r.errors.iter().enumerate().map(|(i, e)| (e.out_line, i)).collect();
+            let current = self.build_error.and_then(|i| r.errors.get(i)).map(|e| e.out_line);
+            egui::ScrollArea::both().auto_shrink([false, false]).stick_to_bottom(true).show_rows(ui, row_h, r.lines.len() + 1, |ui, range| {
+                for i in range {
+                    let Some(l) = r.lines.get(i) else {
+                        ui.label(egui::RichText::new(format!("$ {}   (in {})", r.cmd, r.dir.display())).font(font.clone()).color(weak));
+                        continue;
+                    };
+                    let lower = l.to_lowercase();
+                    let col = if lower.starts_with("error") || lower.contains(" error") {
+                        egui::Color32::from_rgb(0xf0, 0x6a, 0x6a)
+                    } else if lower.starts_with("warning") {
+                        egui::Color32::from_rgb(0xe5, 0xc0, 0x4b)
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    let mut rt = egui::RichText::new(if l.is_empty() { " " } else { l }).font(font.clone()).color(col);
+                    if let Some(&ei) = err_lines.get(&i) {
+                        rt = rt.underline();
+                        if current == Some(i) {
+                            rt = rt.background_color(egui::Color32::from_rgb(0x4f, 0x9c, 0xff).gamma_multiply(0.25));
+                        }
+                        if ui.add(egui::Label::new(rt).sense(egui::Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            jump = Some(Some(ei));
+                        }
+                    } else {
+                        ui.add(egui::Label::new(rt).extend());
+                    }
+                }
+            });
+        }
+        if close {
+            self.panel = None;
+        }
+        match jump {
+            Some(Some(ei)) => {
+                self.build_error = Some(ei);
+                let e = self.build.as_ref().unwrap().errors[ei].clone();
+                self.open_at(&e.path, e.line, e.col);
+            }
+            Some(None) => self.run_build(None),
+            None => {}
+        }
+    }
+
+    /// Ctrl+Shift+B: pick a build system.
+    fn build_menu_ui(&mut self, ctx: &egui::Context) {
+        let Some(list) = self.build_menu.clone() else { return };
+        let mut pick = None;
+        let mut open = true;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+        egui::Window::new("Build With").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]).open(&mut open).show(ctx, |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(14.0, 7.0);
+            for (k, b) in list.iter().enumerate() {
+                let label = if Some(&b.name) == self.build_choice.as_ref() { format!("✓ {}", b.name) } else { b.name.clone() };
+                let num = ctx.input(|i| [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9].get(k).is_some_and(|key| i.key_pressed(*key)));
+                if ui.add(egui::Button::new(label).shortcut_text(if k < 9 { (k + 1).to_string() } else { String::new() }).min_size(egui::vec2(320.0, 0.0))).clicked() || num {
+                    pick = Some(b.clone());
+                }
+            }
+        });
+        if pick.is_some() || !open {
+            self.build_menu = None;
+        }
+        if let Some(b) = pick {
+            self.run_build(Some(b));
+        }
+    }
+
+    fn terminal_panel(&mut self, _ui: &mut egui::Ui) {}
 
     /// Draggable dividers between split groups.
     fn split_dividers(&mut self, ctx: &egui::Context) {
@@ -1934,6 +2148,20 @@ impl eframe::App for App {
             });
         });
 
+        if let Some(r) = self.build.as_mut() {
+            r.poll();
+            if r.running() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+        self.build_menu_ui(ctx);
+        if let Some(p) = self.panel {
+            let fill = self.syn.theme(&self.settings.color_scheme).settings.background.map(editor::c).unwrap_or(ctx.style().visuals.extreme_bg_color);
+            egui::TopBottomPanel::bottom("bottom_panel").resizable(true).default_height(220.0).min_height(80.0).frame(egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(12, 6))).show(ctx, |ui| match p {
+                BottomPanel::Output => self.output_panel(ui),
+                BottomPanel::Terminal => self.terminal_panel(ui),
+            });
+        }
         if self.find.open {
             egui::TopBottomPanel::bottom("find").frame(egui::Frame::new().fill(ctx.style().visuals.panel_fill).inner_margin(egui::Margin::symmetric(12, 8))).show(ctx, |ui| self.find_panel(ui));
         }

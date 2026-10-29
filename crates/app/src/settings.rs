@@ -205,6 +205,11 @@ fn default_keymap() -> Vec<Binding> {
         ("ctrl+k, ctrl+4", "fold_level_4"),
         // Bookmarks
         ("f12", "goto_definition"),
+        ("ctrl+b", "build"),
+        ("f7", "build"),
+        ("ctrl+shift+b", "build_with"),
+        ("f4", "next_result"),
+        ("shift+f4", "prev_result"),
         ("ctrl+alt+f", "lsp_format"),
         ("ctrl+f2", "toggle_bookmark"),
         ("f2", "next_bookmark"),
