@@ -1467,12 +1467,13 @@ impl App {
                         self.drag_tab = Some(i);
                     }
                     let vis = ui.visuals();
-                    let fill = if active { editor_bg } else if resp.hovered() { vis.widgets.hovered.weak_bg_fill } else { egui::Color32::TRANSPARENT };
+                    let fill = if active { editor_bg } else if resp.hovered() { editor_bg.gamma_multiply(0.75) } else { egui::Color32::TRANSPARENT };
                     ui.painter().rect_filled(rect, egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, fill);
                     if active {
                         ui.painter().line_segment([rect.left_top() + egui::vec2(8.0, 0.5), rect.right_top() + egui::vec2(-8.0, 0.5)], egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0x4f, 0x9c, 0xff)));
                     }
-                    let tc = if active { vis.strong_text_color() } else { vis.weak_text_color() };
+                    // Inactive tabs stay readable; hovering brings them up to full strength.
+                    let tc = if active || resp.hovered() { vis.strong_text_color() } else { vis.text_color().gamma_multiply(0.82) };
                     let mut tx = rect.left() + 14.0;
                     if d.buf.is_dirty() {
                         ui.painter().circle_filled(egui::pos2(tx + 3.0, rect.center().y), 3.5, egui::Color32::from_rgb(0xff, 0x9a, 0x3d));
