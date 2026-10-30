@@ -2113,6 +2113,8 @@ fn trim_trailing(b: &mut Buffer) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Runs when update returns (any path): color emoji in everything painted this frame.
+        let _emoji = emoji::FrameEnd(ctx.clone());
         if ctx.cumulative_pass_nr() < 2 {
             trace("frame");
         }

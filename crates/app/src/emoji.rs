@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use eframe::egui::{self, Color32, Pos2, Rect, TextureHandle};
+use eframe::egui::{self, layers::ShapeIdx, text::{LayoutSection, TextFormat}, Color32, LayerId, Pos2, Rect, Shape, TextureHandle};
 
 const FONT_PATHS: &[&str] = &[
     "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
@@ -51,19 +51,100 @@ fn texture(ctx: &egui::Context, c: char) -> Option<TextureHandle> {
         .clone()
 }
 
-/// Paint every emoji of a laid-out galley (positioned at `origin`) as a color bitmap.
-pub fn paint_galley(painter: &egui::Painter, origin: Pos2, galley: &egui::Galley) {
+/// Recolor emoji in every text shape painted this frame (editor, tabs, menus, dialogs...):
+/// the monochrome glyph is made transparent and a color bitmap is painted over it.
+/// Call once at the end of the frame.
+pub fn colorize_frame(ctx: &egui::Context) {
+    let mut layers: Vec<LayerId> = ctx.memory(|m| m.areas().visible_layer_ids().into_iter().collect());
+    layers.push(LayerId::background());
+    layers.sort_by_key(|l| (l.order, l.id.value()));
+    layers.dedup();
+
+    // Collect under the graphics lock, lay out outside it (fonts take the same context lock).
+    let mut found = Vec::new();
+    ctx.graphics(|g| {
+        for &layer in &layers {
+            let Some(list) = g.get(layer) else { continue };
+            for (i, cs) in list.all_entries().enumerate() {
+                if let Shape::Text(t) = &cs.shape {
+                    if t.galley.job.text.chars().any(is_emoji) {
+                        found.push((layer, i, t.clone()));
+                    }
+                }
+            }
+        }
+    });
+    if found.is_empty() {
+        return;
+    }
+    let mut out = Vec::new();
+    for (layer, i, mut t) in found {
+        let mut job = (*t.galley.job).clone();
+        let over = t.override_text_color.take();
+        let mut sections = Vec::new();
+        for sec in &job.sections {
+            let mut fmt = sec.format.clone();
+            if let Some(c) = over {
+                fmt.color = c;
+            } else if fmt.color == Color32::PLACEHOLDER {
+                fmt.color = t.fallback_color;
+            }
+            let text = &job.text[sec.byte_range.clone()];
+            let mut start = sec.byte_range.start;
+            let mut first = true;
+            for (off, ch) in text.char_indices() {
+                if is_emoji(ch) {
+                    let at = sec.byte_range.start + off;
+                    if at > start {
+                        sections.push(LayoutSection { leading_space: if first { sec.leading_space } else { 0.0 }, byte_range: start..at, format: fmt.clone() });
+                        first = false;
+                    }
+                    let end = at + ch.len_utf8();
+                    sections.push(LayoutSection { leading_space: if first { sec.leading_space } else { 0.0 }, byte_range: at..end, format: TextFormat { color: Color32::TRANSPARENT, ..fmt.clone() } });
+                    first = false;
+                    start = end;
+                }
+            }
+            if start < sec.byte_range.end || first {
+                sections.push(LayoutSection { leading_space: if first { sec.leading_space } else { 0.0 }, byte_range: start..sec.byte_range.end, format: fmt });
+            }
+        }
+        job.sections = sections;
+        t.galley = ctx.fonts(|f| f.layout_job(job));
+        let images = emoji_images(ctx, t.pos, &t.galley);
+        out.push((layer, i, t, images));
+    }
+    ctx.graphics_mut(|g| {
+        for (layer, i, t, images) in out {
+            let Some(list) = g.get_mut(layer) else { continue };
+            list.mutate_shape(ShapeIdx(i), |cs| cs.shape = Shape::Vec(std::iter::once(Shape::Text(t)).chain(images).collect()));
+        }
+    });
+}
+
+fn emoji_images(ctx: &egui::Context, origin: Pos2, galley: &egui::Galley) -> Vec<Shape> {
+    let mut v = Vec::new();
     for row in &galley.rows {
         for g in &row.glyphs {
             if !is_emoji(g.chr) {
                 continue;
             }
-            let Some(tex) = texture(painter.ctx(), g.chr) else { continue };
+            let Some(tex) = texture(ctx, g.chr) else { continue };
             let h = g.font_height.min(g.line_height) * 1.05;
             let w = (h * tex.aspect_ratio()).max(1.0);
             let center = origin + egui::vec2(g.pos.x + g.advance_width / 2.0, row.rect.min.y + g.line_height / 2.0);
             let rect = Rect::from_center_size(center, egui::vec2(w, h));
-            painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+            v.push(Shape::image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE));
         }
+    }
+    v
+}
+
+/// Calls [`colorize_frame`] when dropped, i.e. after the rest of the frame has been painted.
+pub struct FrameEnd(pub egui::Context);
+
+impl Drop for FrameEnd {
+    fn drop(&mut self) {
+        colorize_frame(&self.0);
     }
 }
