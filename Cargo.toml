@@ -4,7 +4,7 @@ members = ["crates/core", "crates/syntax", "crates/app"]
 
 [workspace.package]
 edition = "2021"
-version = "0.1.8"
+version = "0.1.9"
 authors = ["Genetzakis Manolis <genetzhs@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/genetzhs/sublimers"
