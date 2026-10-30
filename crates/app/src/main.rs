@@ -1,5 +1,6 @@
 mod build;
 mod editor;
+mod emoji;
 mod git;
 mod lsp;
 mod palette;
@@ -1104,6 +1105,16 @@ impl App {
         arboard::Clipboard::new().ok()?.get_text().ok()
     }
 
+    /// One menu row: label left, shortcut right in a dim font. Closes the menu when clicked.
+    fn menu_item(&self, ui: &mut egui::Ui, label: &str, cmd: &str) -> bool {
+        let keys = settings::shortcut_label(&self.settings.keymap, cmd);
+        let clicked = ui.add(egui::Button::new(label).shortcut_text(egui::RichText::new(keys).size(12.5).color(ui.visuals().text_color().gamma_multiply(0.6))).min_size(egui::vec2(340.0, 30.0))).clicked();
+        if clicked {
+            ui.close_menu();
+        }
+        clicked
+    }
+
     fn apply_visuals(&self, ctx: &egui::Context) {
         let theme = self.syn.theme(&self.settings.color_scheme);
         let bg = theme.settings.background.map(editor::c).unwrap_or(egui::Color32::from_gray(30));
@@ -2158,16 +2169,37 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menu").frame(egui::Frame::new().fill(ctx.style().visuals.panel_fill).inner_margin(egui::Margin::symmetric(8, 4))).show_separator_line(false).show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 let mut cmd = None;
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                 for (menu, items) in palette::MENUS {
                     ui.menu_button(*menu, |ui| {
-                        ui.spacing_mut().button_padding = egui::vec2(14.0, 8.0);
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        for (label, c) in *items {
-                            let keys = settings::shortcut_label(&self.settings.keymap, c);
-                            if ui.add(egui::Button::new(*label).shortcut_text(keys).min_size(egui::vec2(260.0, 0.0))).clicked() {
-                                cmd = Some(*c);
-                                ui.close_menu();
+                        style_menu(ui);
+                        let mut i = 0;
+                        while i < items.len() {
+                            let (label, c) = items[i];
+                            if label == "-" {
+                                ui.separator();
+                                i += 1;
+                                continue;
                             }
+                            // Consecutive "Group: Item" entries collapse into a submenu.
+                            let group = label.split_once(": ").map(|(g, _)| g);
+                            let n = group.map_or(1, |g| items[i..].iter().take_while(|(l, _)| l.split_once(": ").is_some_and(|(h, _)| h == g)).count());
+                            if let (Some(g), true) = (group, n > 1) {
+                                ui.menu_button(g, |ui| {
+                                    style_menu(ui);
+                                    for (label, c) in &items[i..i + n] {
+                                        if self.menu_item(ui, &label[g.len() + 2..], c) {
+                                            cmd = Some(*c);
+                                        }
+                                    }
+                                });
+                                i += n;
+                                continue;
+                            }
+                            if self.menu_item(ui, label, c) {
+                                cmd = Some(c);
+                            }
+                            i += 1;
                         }
                     });
                 }
@@ -2512,4 +2544,16 @@ fn install_fallback_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// Popup menu look: roomy rows, accent-filled hover, thin separators.
+fn style_menu(ui: &mut egui::Ui) {
+    let accent = egui::Color32::from_rgb(0x4f, 0x9c, 0xff);
+    let s = ui.style_mut();
+    s.spacing.button_padding = egui::vec2(12.0, 6.0);
+    s.spacing.item_spacing.y = 2.0;
+    s.visuals.widgets.hovered.weak_bg_fill = accent.gamma_multiply(0.85);
+    s.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+    s.visuals.widgets.open.weak_bg_fill = accent.gamma_multiply(0.35);
+    s.visuals.widgets.noninteractive.bg_stroke.color = s.visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.5);
 }

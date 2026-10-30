@@ -580,6 +580,11 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Doc, a: ViewArgs) -> ViewResponse {
                     let n = tab - *vis % tab;
                     s.extend(std::iter::repeat_n(' ', n));
                     *vis += n;
+                } else if crate::emoji::is_emoji(*ch) {
+                    // Hidden glyph keeps the layout; the color bitmap is painted over it.
+                    job.append(&std::mem::take(&mut s), 0.0, TextFormat { font_id: font.clone(), color, italics: italic, ..Default::default() });
+                    job.append(&ch.to_string(), 0.0, TextFormat { font_id: font.clone(), color: Color32::TRANSPARENT, ..Default::default() });
+                    *vis += 1;
                 } else {
                     s.push(*ch);
                     *vis += 1;
@@ -601,7 +606,8 @@ pub fn show(ui: &mut egui::Ui, doc: &mut Doc, a: ViewArgs) -> ViewResponse {
         let galley = ui.fonts(|f| f.layout_job(job));
         let gy = y_of(v.r) + (row_h - galley.size().y) / 2.0;
         let width = galley.size().x;
-        tp.galley(pos2(x_of(0), gy), galley, fg);
+        tp.galley(pos2(x_of(0), gy), galley.clone(), fg);
+        crate::emoji::paint_galley(&tp, pos2(x_of(0), gy), &galley);
         // Folded block marker after the header line.
         if row_end(v) == v.text.chars().count() && folded.iter().any(|(h, _)| *h == v.row.line) {
             let r = Rect::from_min_size(pos2(x_of(0) + width + char_w, y_of(v.r) + 3.0), vec2(char_w * 3.0, row_h - 6.0));

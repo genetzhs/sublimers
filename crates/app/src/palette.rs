@@ -6,18 +6,23 @@ use nucleo_matcher::{Config, Matcher};
 
 use crate::App;
 
+/// `("-", "")` entries are separators; items named `"Group: Item"` in a row become a submenu.
 pub const MENUS: &[(&str, &[(&str, &str)])] = &[
     ("File", &[
         ("New File", "new_file"),
         ("New Window", "new_window"),
+        ("-", ""),
         ("Open File…", "open_file"),
         ("Open Folder…", "open_folder"),
+        ("-", ""),
         ("Save", "save"),
         ("Save As…", "save_as"),
         ("Save All", "save_all"),
+        ("-", ""),
         ("Reopen Closed File", "reopen_last_file"),
         ("Close File", "close_file"),
         ("Close Window", "close_window"),
+        ("-", ""),
         ("Exit", "exit"),
     ]),
     ("Edit", &[
@@ -25,48 +30,59 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
         ("Redo", "redo"),
         ("Soft Undo", "soft_undo"),
         ("Soft Redo", "soft_redo"),
+        ("-", ""),
         ("Insert Line After", "insert_line_after"),
         ("Insert Line Before", "insert_line_before"),
         ("Join Lines", "join_lines"),
         ("Delete to End of Line", "delete_to_eol"),
         ("Delete to Beginning of Line", "delete_to_bol"),
+        ("-", ""),
         ("Sort Lines", "sort_lines"),
         ("Sort Lines (Case Sensitive)", "sort_lines_case_sensitive"),
         ("Duplicate Line", "duplicate_line"),
         ("Delete Line", "delete_line"),
         ("Swap Line Up", "swap_line_up"),
         ("Swap Line Down", "swap_line_down"),
+        ("-", ""),
         ("Indent", "indent"),
         ("Unindent", "unindent"),
         ("Toggle Comment", "toggle_comment"),
+        ("-", ""),
         ("Convert to Upper Case", "upper_case"),
         ("Convert to Lower Case", "lower_case"),
+        ("-", ""),
         ("Code Folding: Fold", "fold"),
         ("Code Folding: Unfold", "unfold"),
         ("Code Folding: Unfold All", "unfold_all"),
         ("Code Folding: Fold Level 1", "fold_level_1"),
         ("Code Folding: Fold Level 2", "fold_level_2"),
+        ("-", ""),
         ("Show Completions", "auto_complete"),
     ]),
     ("Selection", &[
         ("Select All", "select_all"),
         ("Expand Selection to Line", "expand_selection_to_line"),
+        ("-", ""),
         ("Quick Add Next", "find_under_expand"),
         ("Quick Skip Next", "find_under_expand_skip"),
         ("Quick Find All", "find_all_under"),
+        ("-", ""),
         ("Split into Lines", "split_selection_into_lines"),
         ("Add Cursor Above", "add_cursor_above"),
         ("Add Cursor Below", "add_cursor_below"),
         ("Expand Selection to Brackets", "expand_selection_to_brackets"),
+        ("-", ""),
         ("Single Selection", "single_selection"),
     ]),
     ("Find", &[
         ("Find…", "show_find"),
         ("Find Next", "find_next"),
         ("Find Previous", "find_prev"),
+        ("-", ""),
         ("Quick Find", "find_under"),
         ("Quick Find Previous", "find_under_prev"),
         ("Use Selection for Find", "slurp_find_string"),
+        ("-", ""),
         ("Replace…", "show_replace"),
         ("Find in Files…", "show_find_in_files"),
     ]),
@@ -74,6 +90,7 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
         ("Toggle Side Bar", "toggle_side_bar"),
         ("Toggle Minimap", "toggle_minimap"),
         ("Word Wrap", "toggle_word_wrap"),
+        ("-", ""),
         ("Layout: Single", "set_layout_1"),
         ("Layout: Columns 2", "set_layout_2"),
         ("Layout: Columns 3", "set_layout_3"),
@@ -81,10 +98,12 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
         ("Layout: Rows 2", "set_layout_rows_2"),
         ("Layout: Rows 3", "set_layout_rows_3"),
         ("Layout: Grid 4", "set_layout_grid"),
+        ("-", ""),
         ("Focus Group 1", "focus_group_1"),
         ("Focus Group 2", "focus_group_2"),
         ("Move File to Group 1", "move_to_group_1"),
         ("Move File to Group 2", "move_to_group_2"),
+        ("-", ""),
         ("Enter Full Screen", "toggle_full_screen"),
         ("Enter Distraction Free Mode", "toggle_distraction_free"),
         ("Syntax…", "set_syntax"),
@@ -201,7 +220,7 @@ fn candidates(app: &App) -> Vec<(String, Target)> {
         PaletteMode::Commands => {
             let mut v: Vec<(String, Target)> = MENUS
                 .iter()
-                .flat_map(|(menu, items)| items.iter().map(move |(l, c)| (format!("{menu}: {}", l.trim_end_matches('…')), Target::Command(c.to_string()))))
+                .flat_map(|(menu, items)| items.iter().filter(|(l, _)| *l != "-").map(move |(l, c)| (format!("{menu}: {}", l.trim_end_matches('…')), Target::Command(c.to_string()))))
                 .collect();
             v.extend(app.syn.syntax_names().into_iter().map(|s| (format!("Set Syntax: {s}"), Target::Syntax(s))));
             v.extend(app.syn.theme_names().into_iter().map(|s| (format!("Color Scheme: {s}"), Target::Theme(s))));

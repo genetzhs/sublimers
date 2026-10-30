@@ -28,6 +28,8 @@ trash = "5"
 ureq = "2"
 portable-pty = "0.8"
 vt100 = "0.15"
+ttf-parser = "0.25"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [package.metadata.generate-rpm]
 name = "sublimers"
