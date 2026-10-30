@@ -7,6 +7,7 @@ mod palette;
 mod session;
 mod settings;
 mod terminal;
+mod ui_kit;
 mod updater;
 
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use sublimers_syntax::{DocHighlight, Syntaxes};
 
 use palette::{Palette, PaletteMode};
 use settings::Settings;
+use ui_kit::Tone;
 
 pub struct Doc {
     /// Stable identity, so async results (e.g. a Save As dialog) find the right tab.
@@ -82,31 +84,6 @@ fn lsp_root_for(file: &Path) -> PathBuf {
     }
     const MARKERS: &[&str] = &["Cargo.toml", "go.mod", "package.json", "pyproject.toml", "setup.py", "compile_commands.json"];
     dir.ancestors().find(|a| MARKERS.iter().any(|m| a.join(m).exists())).unwrap_or(dir).to_path_buf()
-}
-
-/// A centred modal card over a dimmed backdrop. Returns true if the backdrop was clicked.
-fn modal_card(ctx: &egui::Context, id: &str, add: impl FnOnce(&mut egui::Ui)) -> bool {
-    let screen = ctx.screen_rect();
-    let mut clicked = false;
-    egui::Area::new(egui::Id::new((id, "backdrop"))).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
-        let r = ui.allocate_rect(screen, egui::Sense::click());
-        ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
-        clicked = r.clicked();
-    });
-    egui::Area::new(egui::Id::new(id)).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-        let v = ui.visuals().clone();
-        egui::Frame::new()
-            .fill(v.window_fill)
-            .stroke(egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color))
-            .corner_radius(14.0)
-            .shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: egui::Color32::from_black_alpha(110) })
-            .inner_margin(egui::Margin::same(28))
-            .show(ui, |ui| {
-                ui.set_width(460.0);
-                add(ui);
-            });
-    });
-    clicked
 }
 
 /// Split-view layout (Sublime's View → Layout).
@@ -885,36 +862,43 @@ impl App {
     fn file_dialog(&mut self, ctx: &egui::Context) {
         let Some(dlg) = &mut self.file_dialog else { return };
         let (title, prompt) = match dlg {
-            FileDialog::NewFile(..) => ("New File", "File name:"),
-            FileDialog::NewFolder(..) => ("New Folder", "Folder name:"),
-            FileDialog::Rename(..) => ("Rename", "New name:"),
+            FileDialog::NewFile(..) => ("New File", "Name of the new file"),
+            FileDialog::NewFolder(..) => ("New Folder", "Name of the new folder"),
+            FileDialog::Rename(..) => ("Rename", "New name"),
             FileDialog::Delete(..) => ("Delete", ""),
         };
         let (mut ok, mut cancel) = (false, false);
-        egui::Window::new(title).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_TOP, [0.0, 120.0]).show(ctx, |ui| {
+        let backdrop = ui_kit::modal(ctx, "file_dialog", 400.0, |ui| {
             match dlg {
                 FileDialog::Delete(p) => {
-                    ui.label(format!("Move “{}” to the trash?", p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()));
+                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    ui_kit::header(ui, Tone::Danger, "✕", false, "Move to Trash?", &format!("“{name}” will be moved to the trash."));
                 }
                 FileDialog::NewFile(_, name) | FileDialog::NewFolder(_, name) | FileDialog::Rename(_, name) => {
-                    ui.label(prompt);
-                    let r = ui.add(egui::TextEdit::singleline(name).desired_width(320.0));
+                    ui.label(egui::RichText::new(title).size(19.0).strong());
+                    ui.label(egui::RichText::new(prompt).size(13.5).color(ui_kit::muted(ui.visuals())));
+                    let r = ui_kit::text_field(ui, name);
                     r.request_focus();
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         ok = true;
                     }
                 }
             }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button(if matches!(dlg, FileDialog::Delete(_)) { "Move to Trash" } else { "OK" }).clicked() {
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let (label, tone) = if matches!(dlg, FileDialog::Delete(_)) { ("Move to Trash", Tone::Danger) } else { ("OK", Tone::Info) };
+                if ui.add(ui_kit::primary(label, tone)).clicked() {
                     ok = true;
                 }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if ui.add(ui_kit::secondary(ui, "Cancel")).clicked() {
                     cancel = true;
                 }
             });
         });
+        if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
         if cancel {
             self.file_dialog = None;
             return;
@@ -1009,61 +993,38 @@ impl App {
         if self.update_restart && matches!(self.update, UpdateState::Done(_)) {
             restart = true;
         }
-        let backdrop = modal_card(ctx, "update_dialog", |ui| {
-            let v = ui.visuals().clone();
-            let weak = v.text_color().gamma_multiply(0.75);
-            let accent = egui::Color32::from_rgb(0xff, 0x9a, 0x3d);
-            let (icon, title, subtitle): (&str, String, String) = match &self.update {
-                UpdateState::Idle | UpdateState::Checking => ("↻", "Checking for updates…".into(), format!("Installed version {}", updater::CURRENT)),
-                UpdateState::UpToDate => ("✓", "You're up to date".into(), format!("Sublimers {} is the latest version.", updater::CURRENT)),
-                UpdateState::Available(r) => ("⬆", format!("Sublimers {} is available", r.version), format!("You have {}. Your open files and unsaved work are kept across the restart.", updater::CURRENT)),
-                UpdateState::Installing => ("⬇", "Installing update…".into(), "Downloading and installing. Sublimers will restart when it's done.".into()),
-                UpdateState::Done(m) => ("✓", "Update installed".into(), m.clone()),
-                UpdateState::Error(e) => ("!", "Update failed".into(), e.clone()),
+        let backdrop = ui_kit::modal(ctx, "update_dialog", 440.0, |ui| {
+            let (tone, icon, title, subtitle): (Tone, &str, String, String) = match &self.update {
+                UpdateState::Idle | UpdateState::Checking => (Tone::Info, "", "Checking for updates…".into(), format!("Installed version {}", updater::CURRENT)),
+                UpdateState::UpToDate => (Tone::Success, "✓", "You're up to date".into(), format!("Sublimers {} is the latest version.", updater::CURRENT)),
+                UpdateState::Available(r) => (Tone::Info, "↑", format!("Sublimers {} is available", r.version), format!("You have {}. Open files and unsaved work are kept across the restart.", updater::CURRENT)),
+                UpdateState::Installing => (Tone::Info, "", "Installing update…".into(), "Downloading and installing. Sublimers restarts when it's done.".into()),
+                UpdateState::Done(m) => (Tone::Success, "✓", "Update installed".into(), m.clone()),
+                UpdateState::Error(e) => (Tone::Danger, "!", "Update failed".into(), e.clone()),
             };
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
-                let col = if matches!(self.update, UpdateState::Error(_)) { egui::Color32::from_rgb(0xf0, 0x6a, 0x6a) } else { accent };
-                ui.painter().circle_filled(r.center(), 22.0, col.gamma_multiply(0.18));
-                if matches!(self.update, UpdateState::Checking | UpdateState::Idle | UpdateState::Installing) {
-                    egui::Spinner::new().size(22.0).color(col).paint_at(ui, egui::Rect::from_center_size(r.center(), egui::vec2(22.0, 22.0)));
-                } else {
-                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(22.0), col);
-                }
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    ui.label(egui::RichText::new(title).size(21.0).strong());
-                    ui.add_space(2.0);
-                    ui.label(egui::RichText::new(subtitle).size(14.5).color(weak));
-                });
-            });
+            let busy = matches!(self.update, UpdateState::Checking | UpdateState::Idle | UpdateState::Installing);
+            ui_kit::header(ui, tone, icon, busy, &title, &subtitle);
             if let UpdateState::Available(r) = &self.update {
                 let notes: String = r.notes.lines().filter(|l| !l.contains("Full Changelog")).collect::<Vec<_>>().join("\n");
                 if !notes.trim().is_empty() {
-                    ui.add_space(14.0);
-                    egui::Frame::new().fill(v.extreme_bg_color).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                    ui.add_space(10.0);
+                    let v = ui.visuals().clone();
+                    ui_kit::inset_frame(&v).show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| ui.label(egui::RichText::new(notes.trim()).size(13.5)));
+                        ui.label(egui::RichText::new("WHAT'S NEW").size(11.5).strong().color(ui_kit::muted(&v)));
+                        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| ui.label(egui::RichText::new(notes.trim()).size(13.5)));
                     });
                 }
             }
-            ui.add_space(22.0);
-            let btn = |text: &str, primary: bool| {
-                let mut rt = egui::RichText::new(text).size(15.0);
-                if primary {
-                    rt = rt.color(egui::Color32::BLACK).strong();
-                }
-                let b = egui::Button::new(rt).min_size(egui::vec2(110.0, 38.0)).corner_radius(8.0);
-                if primary { b.fill(accent) } else { b }
-            };
+            ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.spacing_mut().item_spacing.x = 8.0;
                 match &self.update {
                     UpdateState::Available(r) => {
-                        if installable && ui.add(btn("Update & Restart", true)).clicked() {
+                        if installable && ui.add(ui_kit::primary("Update & Restart", Tone::Info).min_size(egui::vec2(150.0, 36.0))).clicked() {
                             install = Some(r.clone());
                         }
-                        if ui.add(btn("Later", false)).clicked() {
+                        if ui.add(ui_kit::secondary(ui, "Later")).clicked() {
                             close = true;
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1071,13 +1032,13 @@ impl App {
                         });
                     }
                     UpdateState::Done(_) => {
-                        if ui.add(btn("Restart Now", true)).clicked() {
+                        if ui.add(ui_kit::primary("Restart Now", Tone::Success)).clicked() {
                             restart = true;
                         }
                     }
                     UpdateState::Installing => {}
                     _ => {
-                        if ui.add(btn("OK", true)).clicked() {
+                        if ui.add(ui_kit::primary("OK", Tone::Info)).clicked() {
                             close = true;
                         }
                     }
@@ -1698,16 +1659,22 @@ impl App {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             open = false;
         }
-        egui::Window::new("Build With").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]).open(&mut open).show(ctx, |ui| {
-            ui.spacing_mut().button_padding = egui::vec2(14.0, 7.0);
+        let backdrop = ui_kit::modal(ctx, "build_with", 380.0, |ui| {
+            ui.label(egui::RichText::new("Build With").size(19.0).strong());
+            ui.label(egui::RichText::new("Pick a build system for this file").size(13.5).color(ui_kit::muted(ui.visuals())));
+            ui.add_space(4.0);
+            style_menu(ui);
             for (k, b) in list.iter().enumerate() {
-                let label = if Some(&b.name) == self.build_choice.as_ref() { format!("✓ {}", b.name) } else { b.name.clone() };
+                let label = if Some(&b.name) == self.build_choice.as_ref() { format!("✓  {}", b.name) } else { b.name.clone() };
                 let num = ctx.input(|i| [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9].get(k).is_some_and(|key| i.key_pressed(*key)));
-                if ui.add(egui::Button::new(label).shortcut_text(if k < 9 { (k + 1).to_string() } else { String::new() }).min_size(egui::vec2(320.0, 0.0))).clicked() || num {
+                if ui.add(egui::Button::new(label).shortcut_text(if k < 9 { (k + 1).to_string() } else { String::new() }).min_size(egui::vec2(ui.available_width(), 34.0))).clicked() || num {
                     pick = Some(b.clone());
                 }
             }
         });
+        if backdrop || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
         if pick.is_some() || !open {
             self.build_menu = None;
         }
@@ -2420,67 +2387,28 @@ impl eframe::App for App {
                     None
                 }
             });
-            let screen = ctx.screen_rect();
-            // Dim everything behind the dialog; clicking outside cancels.
-            egui::Area::new(egui::Id::new("unsaved_backdrop")).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
-                let r = ui.allocate_rect(screen, egui::Sense::click());
-                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(140));
-                if r.clicked() {
-                    choice = Some(Choice::Cancel);
-                }
-            });
             let name = self.docs[i].buf.name();
-            let accent = egui::Color32::from_rgb(0xff, 0x9a, 0x3d);
-            egui::Area::new(egui::Id::new("unsaved_dialog")).order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                let v = ui.visuals().clone();
-                egui::Frame::new()
-                    .fill(v.window_fill)
-                    .stroke(egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color))
-                    .corner_radius(14.0)
-                    .shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: egui::Color32::from_black_alpha(110) })
-                    .inner_margin(egui::Margin::same(28))
-                    .show(ui, |ui| {
-                        ui.set_width(440.0);
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
-                            ui.painter().circle_filled(r.center(), 22.0, accent.gamma_multiply(0.18));
-                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "!", egui::FontId::proportional(26.0), accent);
-                            ui.add_space(10.0);
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("Save changes?").size(21.0).strong());
-                                ui.add_space(2.0);
-                                ui.label(egui::RichText::new(format!("\"{name}\" has unsaved changes. They will be lost if you don't save them.")).size(14.5).color(v.text_color().gamma_multiply(0.75)));
-                            });
-                        });
-                        ui.add_space(24.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.spacing_mut().item_spacing.x = 10.0;
-                            let btn = |text: &str, fill: Option<egui::Color32>| {
-                                let mut rt = egui::RichText::new(text).size(15.0);
-                                if fill.is_some() {
-                                    rt = rt.color(egui::Color32::BLACK).strong();
-                                }
-                                let mut b = egui::Button::new(rt).min_size(egui::vec2(110.0, 38.0)).corner_radius(8.0);
-                                if let Some(f) = fill {
-                                    b = b.fill(f);
-                                }
-                                b
-                            };
-                            if ui.add(btn("Save", Some(accent))).clicked() {
-                                choice = Some(Choice::Save);
-                            }
-                            if ui.add(btn("Cancel", None)).clicked() {
-                                choice = Some(Choice::Cancel);
-                            }
-                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                let rt = egui::RichText::new("Don't Save").size(15.0).color(egui::Color32::from_rgb(0xf0, 0x6a, 0x6a));
-                                if ui.add(egui::Button::new(rt).frame(false).min_size(egui::vec2(100.0, 38.0))).clicked() {
-                                    choice = Some(Choice::Discard);
-                                }
-                            });
-                        });
+            let backdrop = ui_kit::modal(ctx, "unsaved_dialog", 420.0, |ui| {
+                ui_kit::header(ui, Tone::Warning, "!", false, "Save changes?", &format!("“{name}” has unsaved changes. They'll be lost if you don't save them."));
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.add(ui_kit::primary("Save", Tone::Info)).clicked() {
+                        choice = Some(Choice::Save);
+                    }
+                    if ui.add(ui_kit::secondary(ui, "Cancel")).clicked() {
+                        choice = Some(Choice::Cancel);
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if ui.add(ui_kit::ghost("Don't Save", Tone::Danger)).clicked() {
+                            choice = Some(Choice::Discard);
+                        }
                     });
+                });
             });
+            if backdrop {
+                choice = Some(Choice::Cancel);
+            }
             if let Some(c) = choice {
                 self.pending_close = None;
                 match c {

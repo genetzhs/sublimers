@@ -316,7 +316,7 @@ pub fn show(ctx: &egui::Context, app: &mut App) {
         .anchor(egui::Align2::CENTER_TOP, [0.0, 60.0])
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+            crate::ui_kit::card_frame(&ui.visuals().clone()).inner_margin(egui::Margin::same(10)).corner_radius(14.0).show(ui, |ui| {
                 ui.set_width(width);
                 let r = ui.add(egui::TextEdit::singleline(&mut p.input).hint_text(hint).desired_width(width).font(egui::FontId::proportional(16.0)).margin(egui::Margin::symmetric(10, 8)));
                 ui.add_space(6.0);
