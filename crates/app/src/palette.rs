@@ -109,6 +109,7 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
         ("Syntax…", "set_syntax"),
         ("Font: Larger", "increase_font_size"),
         ("Font: Smaller", "decrease_font_size"),
+        ("Font: Reset", "reset_font_size"),
     ]),
     ("Goto", &[
         ("Goto Anything…", "show_overlay_goto"),
@@ -129,6 +130,10 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
     ("Help", &[("Check for Updates…", "check_for_updates")]),
     ("Preferences", &[
         ("Select Color Scheme…", "select_theme"),
+        ("Font Size: Larger", "increase_font_size"),
+        ("Font Size: Smaller", "decrease_font_size"),
+        ("Font Size: Reset", "reset_font_size"),
+        ("-", ""),
         ("Font Weight: Light", "font_weight_light"),
         ("Font Weight: Regular", "font_weight_regular"),
         ("Font Weight: Medium", "font_weight_medium"),

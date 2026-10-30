@@ -817,8 +817,12 @@ fn highlight_word(b: &Buffer) -> Option<String> {
     if b.sels.len() != 1 {
         return None;
     }
+    // Like Sublime: only a selected word lights up its other occurrences, not a bare caret.
     let s = b.sels[0];
-    let (a, e) = if s.is_empty() { b.word_at(s.head) } else { (s.start(), s.end()) };
+    if s.is_empty() {
+        return None;
+    }
+    let (a, e) = (s.start(), s.end());
     if e <= a || e - a > 100 {
         return None;
     }
@@ -827,7 +831,7 @@ fn highlight_word(b: &Buffer) -> Option<String> {
         return None;
     }
     // A selection must be the whole word.
-    if !s.is_empty() && b.word_at(a) != (a, e) {
+    if b.word_at(a) != (a, e) {
         return None;
     }
     Some(w)

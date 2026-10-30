@@ -228,6 +228,7 @@ fn default_keymap() -> Vec<Binding> {
         ("ctrl+=", "increase_font_size"),
         ("ctrl+shift+=", "increase_font_size"),
         ("ctrl+-", "decrease_font_size"),
+        ("ctrl+0", "reset_font_size"),
     ];
     let tabs: Vec<(String, String)> = (1..=9).map(|n| (format!("alt+{n}"), format!("select_by_index_{}", n - 1))).chain([("alt+0".to_string(), "select_by_index_9".to_string())]).collect();
     let mut out: Vec<Binding> = v.drain(..).map(|(k, c)| Binding { keys: k.split(", ").map(String::from).collect(), command: c.into() }).collect();

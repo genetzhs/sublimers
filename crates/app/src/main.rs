@@ -1412,8 +1412,11 @@ impl App {
                 }
             }
             "toggle_side_bar" => self.show_sidebar = !self.show_sidebar,
-            "increase_font_size" | "decrease_font_size" => {
-                self.settings.font_size = (self.settings.font_size + if cmd == "increase_font_size" { 1.0 } else { -1.0 }).clamp(6.0, 48.0);
+            "increase_font_size" | "decrease_font_size" | "reset_font_size" => {
+                self.settings.font_size = match cmd {
+                    "reset_font_size" => Settings::default().font_size,
+                    _ => (self.settings.font_size + if cmd == "increase_font_size" { 1.0 } else { -1.0 }).clamp(6.0, 48.0),
+                };
                 self.settings.save();
                 self.apply_visuals(ctx);
             }
