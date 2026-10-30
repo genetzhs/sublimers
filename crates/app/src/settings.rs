@@ -304,7 +304,14 @@ pub fn match_keys(ctx: &egui::Context, keymap: &[Binding], typing_elsewhere: boo
         while idx < i.events.len() {
             let (key, m) = match &i.events[idx] {
                 // Prefer the physical key so shortcuts work with shift and non-US layouts (e.g. Greek).
-                egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } => (physical_key.unwrap_or(*key), *modifiers),
+                egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } => {
+                    // Numpad / shifted "+" counts as "=" so Ctrl++ and Ctrl+= both zoom in.
+                    let k = match physical_key.unwrap_or(*key) {
+                        Key::Plus => Key::Equals,
+                        k => k,
+                    };
+                    (k, *modifiers)
+                }
                 _ => {
                     // Any typed text cancels a pending chord.
                     if matches!(i.events[idx], egui::Event::Text(_)) {

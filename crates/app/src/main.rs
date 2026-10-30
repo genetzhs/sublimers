@@ -189,6 +189,8 @@ pub struct App {
     term_focus: bool,
     /// Restart automatically once the update is installed.
     update_restart: bool,
+    /// Ctrl+wheel notches not yet turned into a font size step.
+    zoom_acc: f32,
     /// Bottom panel (build output / terminal) and its state.
     panel: Option<BottomPanel>,
     build: Option<build::Run>,
@@ -276,6 +278,7 @@ impl App {
             term: None,
             term_focus: false,
             update_restart: false,
+            zoom_acc: 0.0,
             panel: None,
             build: None,
             build_choice: None,
@@ -1060,6 +1063,26 @@ impl App {
             self.save_session();
             session::spawn_window(&[]);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Ctrl + mouse wheel steps the font size one point per notch. X11 can deliver a notch as
+    /// several line events in one frame, so line wheels count once per frame; touchpad pixels accumulate.
+    fn wheel_zoom(&mut self, ctx: &egui::Context) {
+        let (lines, points) = ctx.input(|i| {
+            i.events.iter().fold((0.0_f32, 0.0_f32), |(l, p), e| match e {
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, modifiers } if modifiers.command => (l, p + delta.y),
+                egui::Event::MouseWheel { delta, modifiers, .. } if modifiers.command => (l + delta.y, p),
+                _ => (l, p),
+            })
+        });
+        // f32::signum(0.0) is 1.0, so guard the no-wheel case.
+        let notch = if lines == 0.0 { 0.0 } else { lines.signum() };
+        self.zoom_acc += notch + points / 50.0;
+        while self.zoom_acc.abs() >= 1.0 {
+            let up = self.zoom_acc > 0.0;
+            self.zoom_acc -= 1.0_f32.copysign(self.zoom_acc);
+            self.run_command(ctx, if up { "increase_font_size" } else { "decrease_font_size" });
         }
     }
 
@@ -2094,7 +2117,10 @@ impl eframe::App for App {
         let _emoji = emoji::FrameEnd(ctx.clone());
         if ctx.cumulative_pass_nr() < 2 {
             trace("frame");
+            // Ctrl +/-/0 change the editor font (our keymap), not egui's whole-UI zoom.
+            ctx.options_mut(|o| o.zoom_with_keyboard = false);
         }
+        self.wheel_zoom(ctx);
         if let Some(files) = self.files_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.files = files;
             self.files_rx = None;
