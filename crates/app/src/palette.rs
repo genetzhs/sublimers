@@ -129,6 +129,11 @@ pub const MENUS: &[(&str, &[(&str, &str)])] = &[
     ("Help", &[("Check for Updates…", "check_for_updates")]),
     ("Preferences", &[
         ("Select Color Scheme…", "select_theme"),
+        ("Font Weight: Light", "font_weight_light"),
+        ("Font Weight: Regular", "font_weight_regular"),
+        ("Font Weight: Medium", "font_weight_medium"),
+        ("Font Weight: Bold", "font_weight_bold"),
+        ("-", ""),
         ("Settings", "open_settings"),
         ("Key Bindings", "open_keybindings"),
         ("Reload Settings", "reload_settings"),

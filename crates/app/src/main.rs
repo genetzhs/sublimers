@@ -264,8 +264,8 @@ enum FileDialog {
 impl App {
     fn new(cc: &eframe::CreationContext, args: Vec<PathBuf>, window: session::Window) -> Self {
         trace("App::new start");
-        install_fallback_fonts(&cc.egui_ctx);
         let settings = Settings::load();
+        install_fonts(&cc.egui_ctx, &settings);
         let mut app = Self {
             syn: Syntaxes::load(Some(&settings::config_dir())),
             settings,
@@ -478,7 +478,8 @@ impl App {
                 (None, None) => continue,
             };
             self.settings.apply_to(&mut buf);
-            let syntax = self.syn.by_name(&sd.syntax).unwrap_or_else(|| self.syn.detect(sd.path.as_deref(), &content_sample(&buf)));
+            // "Plain Text" is re-detected: older versions saved it before content sniffing existed.
+            let syntax = self.syn.by_name(&sd.syntax).filter(|s| s.name != "Plain Text").unwrap_or_else(|| self.syn.detect(sd.path.as_deref(), &content_sample(&buf)));
             let hl = DocHighlight::new(syntax);
             buf.set_caret(sd.caret);
             let mut doc = Doc::new(buf, hl, sd.group.min(editor::MAX_GROUPS - 1));
@@ -1428,6 +1429,7 @@ impl App {
             }
             "reload_settings" => {
                 self.settings = Settings::load();
+                install_fonts(ctx, &self.settings);
                 for d in &mut self.docs {
                     self.settings.apply_to(&mut d.buf);
                 }
@@ -1436,6 +1438,11 @@ impl App {
             "toggle_word_wrap" => {
                 self.settings.word_wrap = !self.settings.word_wrap;
                 self.settings.save();
+            }
+            c if c.starts_with("font_weight_") => {
+                self.settings.font_weight = c["font_weight_".len()..].to_string();
+                self.settings.save();
+                install_fonts(ctx, &self.settings);
             }
             "toggle_minimap" => {
                 self.settings.minimap = !self.settings.minimap;
@@ -2523,9 +2530,9 @@ fn content_sample(buf: &Buffer) -> String {
     buf.text().lines().take(60).collect::<Vec<_>>().join("\n")
 }
 
-/// Append system fonts as fallbacks so symbols (€, box drawing, Greek...) and emoji render
-/// instead of showing as empty boxes. Missing files are skipped.
-fn install_fallback_fonts(ctx: &egui::Context) {
+/// Editor font: bundled Fira Code at the weight from `font_weight`, or the system font named by
+/// `font_face`. System fonts are appended as fallbacks so symbols (€, box drawing...) render.
+fn install_fonts(ctx: &egui::Context, settings: &Settings) {
     const CANDIDATES: &[&str] = &[
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -2537,6 +2544,17 @@ fn install_fallback_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/gdouros-symbola/Symbola.ttf",
     ];
     let mut fonts = egui::FontDefinitions::default();
+    let editor: Vec<u8> = system_font(&settings.font_face).unwrap_or_else(|| {
+        match settings.font_weight.to_ascii_lowercase().as_str() {
+            "regular" | "normal" => &include_bytes!("../fonts/FiraCode-Regular.ttf")[..],
+            "medium" => &include_bytes!("../fonts/FiraCode-Medium.ttf")[..],
+            "bold" => &include_bytes!("../fonts/FiraCode-Bold.ttf")[..],
+            _ => &include_bytes!("../fonts/FiraCode-Light.ttf")[..],
+        }
+        .to_vec()
+    });
+    fonts.font_data.insert("editor".into(), std::sync::Arc::new(egui::FontData::from_owned(editor)));
+    fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "editor".into());
     for path in CANDIDATES {
         let Ok(bytes) = std::fs::read(path) else { continue };
         let name = path.to_string();
@@ -2558,4 +2576,17 @@ fn style_menu(ui: &mut egui::Ui) {
     s.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
     s.visuals.widgets.open.weak_bg_fill = accent.gamma_multiply(0.35);
     s.visuals.widgets.noninteractive.bg_stroke.color = s.visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.5);
+}
+
+/// Resolve a font family name (or a direct file path) to font bytes via fontconfig.
+fn system_font(face: &str) -> Option<Vec<u8>> {
+    let face = face.trim();
+    if face.is_empty() {
+        return None;
+    }
+    if std::path::Path::new(face).is_file() {
+        return std::fs::read(face).ok();
+    }
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", face]).output().ok()?;
+    std::fs::read(String::from_utf8(out.stdout).ok()?.trim()).ok()
 }

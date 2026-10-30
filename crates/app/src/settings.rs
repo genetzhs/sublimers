@@ -11,6 +11,10 @@ use sublimers_core::Buffer;
 pub struct Settings {
     pub color_scheme: String,
     pub font_size: f32,
+    /// Weight of the bundled editor font: "light" (default), "regular", "medium" or "bold".
+    pub font_weight: String,
+    /// System font family (e.g. "DejaVu Sans Mono") or font file path; empty uses the bundled Fira Code.
+    pub font_face: String,
     pub tab_size: usize,
     pub translate_tabs_to_spaces: bool,
     pub word_wrap: bool,
@@ -31,6 +35,8 @@ impl Default for Settings {
         Self {
             color_scheme: "Mariana".into(),
             font_size: 16.0,
+            font_weight: "light".into(),
+            font_face: String::new(),
             tab_size: 4,
             translate_tabs_to_spaces: true,
             word_wrap: false,

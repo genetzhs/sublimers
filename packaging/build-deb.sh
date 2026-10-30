@@ -30,4 +30,14 @@ Description: Fast, Sublime Text-style code editor written in Rust
  Multi-cursor editing, Goto Anything, command palette, split view,
  code folding, syntax highlighting and hot exit.
 CTL
+# Refresh icon and menu caches so a changed icon shows up without logging out.
+for script in postinst postrm; do
+    cat > "$ROOT/DEBIAN/$script" <<'SH'
+#!/bin/sh
+set -e
+command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -f -q /usr/share/icons/hicolor || true
+command -v update-desktop-database >/dev/null && update-desktop-database -q /usr/share/applications || true
+SH
+    chmod 755 "$ROOT/DEBIAN/$script"
+done
 dpkg-deb --root-owner-group --build "$ROOT" "target/sublimers_${VERSION}_amd64.deb"

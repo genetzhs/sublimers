@@ -3444,7 +3444,7 @@ dependencies = [
 
 [[package]]
 name = "sublimers"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arboard",
  "dirs",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "sublimers-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "encoding_rs",
  "regex",
@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "sublimers-syntax"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "ropey",
  "syntect",
