@@ -29,8 +29,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            color_scheme: "base16-ocean.dark".into(),
-            font_size: 14.0,
+            color_scheme: "Mariana".into(),
+            font_size: 16.0,
             tab_size: 4,
             translate_tabs_to_spaces: true,
             word_wrap: false,

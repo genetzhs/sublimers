@@ -263,6 +263,7 @@ enum FileDialog {
 impl App {
     fn new(cc: &eframe::CreationContext, args: Vec<PathBuf>, window: session::Window) -> Self {
         trace("App::new start");
+        install_fallback_fonts(&cc.egui_ctx);
         let settings = Settings::load();
         let mut app = Self {
             syn: Syntaxes::load(Some(&settings::config_dir())),
@@ -379,7 +380,7 @@ impl App {
             if let Some(i) = self.docs.iter().position(|d| d.preview && d.group == self.focus && !d.buf.is_dirty()) {
                 if let Ok(mut buf) = Buffer::open(path) {
                     self.settings.apply_to(&mut buf);
-                    let first = buf.line_text(0);
+                    let first = content_sample(&buf);
                     let hl = DocHighlight::new(self.syn.detect(Some(path), &first));
                     let mut d = Doc::new(buf, hl, self.focus);
                     d.preview = true;
@@ -393,7 +394,7 @@ impl App {
         match Buffer::open(path) {
             Ok(mut buf) => {
                 self.settings.apply_to(&mut buf);
-                let first = buf.line_text(0);
+                let first = content_sample(&buf);
                 let hl = DocHighlight::new(self.syn.detect(Some(path), &first));
                 // Replace a pristine untitled tab.
                 if self.docs.len() == 1 && self.docs[0].buf.path.is_none() && self.docs[0].buf.is_empty() && !self.docs[0].buf.is_dirty() {
@@ -476,7 +477,7 @@ impl App {
                 (None, None) => continue,
             };
             self.settings.apply_to(&mut buf);
-            let syntax = self.syn.by_name(&sd.syntax).unwrap_or_else(|| self.syn.detect(sd.path.as_deref(), &buf.line_text(0)));
+            let syntax = self.syn.by_name(&sd.syntax).unwrap_or_else(|| self.syn.detect(sd.path.as_deref(), &content_sample(&buf)));
             let hl = DocHighlight::new(syntax);
             buf.set_caret(sd.caret);
             let mut doc = Doc::new(buf, hl, sd.group.min(editor::MAX_GROUPS - 1));
@@ -541,7 +542,7 @@ impl App {
                 doc.preview = false;
                 doc.disk_deleted = false;
                 if doc.hl.syntax_name == "Plain Text" {
-                    let first = doc.buf.line_text(0);
+                    let first = content_sample(&doc.buf);
                     doc.hl.set_syntax(self.syn.detect(Some(path), &first));
                 }
             }
@@ -1139,9 +1140,9 @@ impl App {
         style.spacing.item_spacing = egui::vec2(8.0, 4.0);
         style.spacing.button_padding = egui::vec2(10.0, 4.0);
         style.spacing.menu_margin = egui::Margin::same(8);
-        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
-        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.5));
-        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.5));
         style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(self.settings.font_size));
         ctx.set_style(style);
     }
@@ -2482,3 +2483,33 @@ fn main() -> eframe::Result {
     eframe::run_native("Sublimers", opts, Box::new(|cc| Ok(Box::new(App::new(cc, args, window)))))
 }
 
+
+/// First lines of a buffer, used for syntax detection.
+fn content_sample(buf: &Buffer) -> String {
+    buf.text().lines().take(60).collect::<Vec<_>>().join("\n")
+}
+
+/// Append system fonts as fallbacks so symbols (€, box drawing, Greek...) and emoji render
+/// instead of showing as empty boxes. Missing files are skipped.
+fn install_fallback_fonts(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/gdouros-symbola/Symbola.ttf",
+    ];
+    let mut fonts = egui::FontDefinitions::default();
+    for path in CANDIDATES {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let name = path.to_string();
+        fonts.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+        for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+            fonts.families.entry(family).or_default().push(name.clone());
+        }
+    }
+    ctx.set_fonts(fonts);
+}

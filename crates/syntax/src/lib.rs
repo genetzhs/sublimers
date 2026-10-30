@@ -79,10 +79,16 @@ impl Syntaxes {
         v
     }
 
-    pub fn detect(&self, path: Option<&Path>, first_line: &str) -> &SyntaxReference {
+    /// Pick a syntax from the file name, then the first line, then a sniff of the content
+    /// (so a `.txt` full of shell commands still gets highlighted).
+    pub fn detect(&self, path: Option<&Path>, sample: &str) -> &SyntaxReference {
+        let plain = self.set.find_syntax_plain_text();
+        let first_line = sample.lines().next().unwrap_or("");
         path.and_then(|p| self.set.find_syntax_for_file(p).ok().flatten())
+            .filter(|s| s.name != plain.name)
             .or_else(|| self.set.find_syntax_by_first_line(first_line))
-            .unwrap_or_else(|| self.set.find_syntax_plain_text())
+            .or_else(|| sniff(sample).and_then(|n| self.set.find_syntax_by_name(n)))
+            .unwrap_or(plain)
     }
 
     pub fn by_name(&self, name: &str) -> Option<&SyntaxReference> {
@@ -196,5 +202,34 @@ mod tests {
             assert!(syn.themes.themes.contains_key(*name), "missing bundled theme {name}");
         }
         assert!(syn.theme("Dracula").settings.background.is_some());
+    }
+}
+
+/// Guess a syntax name from content when nothing else matched. Currently: shell scripts / command notes.
+fn sniff(sample: &str) -> Option<&'static str> {
+    const CMDS: &[&str] = &[
+        "apt", "apt-get", "sudo", "cd", "ls", "cp", "mv", "rm", "mkdir", "chmod", "chown", "echo", "export",
+        "wget", "curl", "git", "systemctl", "service", "vim", "vi", "nano", "cat", "grep", "tar", "dpkg",
+        "yum", "dnf", "ln", "find", "ssh", "scp", "rsync", "docker", "npm", "pip", "make", "source", "for",
+        "if", "while", "touch", "useradd", "passwd", "crontab", "mysql", "php", "composer", "certbot", "ufw",
+    ];
+    let lines: Vec<&str> = sample.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    let hits = lines.iter().filter(|l| {
+        let w = l.trim_start_matches("$ ").split_whitespace().next().unwrap_or("");
+        CMDS.contains(&w) || l.starts_with('#') || l.contains(" | ") || l.contains(" && ")
+    }).count();
+    (hits * 10 >= lines.len() * 4).then_some("Bourne Again Shell (bash)")
+}
+
+#[cfg(test)]
+mod sniff_tests {
+    #[test]
+    fn shell_notes_detected() {
+        let s = "apt update && apt upgrade -y\nvim .ssh/authorized_keys\n\nwget http://x/y.deb\ndpkg -i y.deb\nsome note";
+        assert_eq!(super::sniff(s), Some("Bourne Again Shell (bash)"));
+        assert_eq!(super::sniff("Dear John,\nhello there\nregards"), None);
     }
 }

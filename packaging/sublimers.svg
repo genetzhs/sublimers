@@ -16,10 +16,6 @@
   <rect x="32" y="32" width="448" height="448" rx="108" fill="url(#bg)"/>
   <rect x="32" y="32" width="448" height="448" rx="108" fill="url(#gloss)"/>
   <rect x="33.5" y="33.5" width="445" height="445" rx="106.5" fill="none" stroke="#fff" stroke-opacity="0.25" stroke-width="3"/>
-  <g filter="url(#sh)" stroke="#fff" stroke-linecap="round" stroke-width="46" fill="none">
-    <line x1="150" y1="196" x2="362" y2="140"/>
-    <line x1="150" y1="276" x2="300" y2="236" stroke-opacity="0.85"/>
-    <line x1="150" y1="356" x2="362" y2="300"/>
-  </g>
-  <rect x="346" y="214" width="16" height="64" rx="8" fill="#fff" filter="url(#sh)" transform="rotate(-15 354 246)"/>
+  <text x="246" y="378" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-weight="bold" font-size="330" fill="#fff" filter="url(#sh)">S</text>
+  <rect x="374" y="150" width="22" height="240" rx="11" fill="#fff" fill-opacity="0.9" filter="url(#sh)"/>
 </svg>
